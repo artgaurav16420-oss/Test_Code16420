@@ -514,11 +514,20 @@ def _portfolio_activity_badge(state: PortfolioState) -> str:
 
 def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     """Render a richer command palette for daily operations."""
+    box_width = 78
+
+    def _menu_box_line(text: str = "") -> str:
+        trimmed = text[:box_width]
+        return f"{C.BLU}  │{C.RST}{trimmed:<{box_width}}{C.BLU}│{C.RST}"
+
     now = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    print(f"\n{C.BLU}  ╭──────────────────────────────────────────────────────────────────────────────╮{C.RST}")
-    print(f"{C.BLU}  │{C.RST}                {C.B_CYN}ULTIMATE MOMENTUM V{__version__} — DAILY WORKFLOW{C.RST}                 {C.BLU}│{C.RST}")
-    print(f"{C.BLU}  │{C.RST}  {C.GRY}Snapshot:{C.RST} {now:<26} {C.GRY}Tip:{C.RST} Run status after each scan to review drift.{C.BLU} │{C.RST}")
-    print(f"{C.BLU}  ╰──────────────────────────────────────────────────────────────────────────────╯{C.RST}")
+    title = f"ULTIMATE MOMENTUM V{__version__} — DAILY WORKFLOW"
+    snapshot = f"Snapshot: {now}    Tip: Run status after each scan."
+
+    print(f"\n{C.BLU}  ╭{'─' * box_width}╮{C.RST}")
+    print(_menu_box_line(f"{title:^{box_width}}"))
+    print(_menu_box_line(f"  {snapshot}"))
+    print(f"{C.BLU}  ╰{'─' * box_width}╯{C.RST}")
 
     print(f"  {C.B_CYN}Scans & Research{C.RST}")
     print(f"    {C.BLD}[1]{C.RST} NSE Total Scan      {C.GRY}Run full-market rebalance preview.{C.RST}")
