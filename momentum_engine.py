@@ -263,6 +263,20 @@ class PortfolioState:
         ps     = cls()
         errors: List[str] = []
 
+        def _as_bool(value) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                v = value.strip().lower()
+                if v in {"true", "1", "yes", "y", "on"}:
+                    return True
+                if v in {"false", "0", "no", "n", "off"}:
+                    return False
+                raise ValueError(f"cannot parse bool from '{value}'")
+            if isinstance(value, (int, float)):
+                return bool(value)
+            raise TypeError(f"unsupported bool type: {type(value).__name__}")
+
         def _get(key, converter, default):
             try:
                 return converter(d[key]) if key in d else default
@@ -277,7 +291,8 @@ class PortfolioState:
         ps.universe             = _get("universe",             list,                                            [])
         ps.cash                 = _get("cash",                 float,                                           ps.cash)
         ps.exposure_multiplier  = _get("exposure_multiplier",  float,                                           1.0)
-        ps.override_active      = _get("override_active",      bool,                                            False)
+        # bool("False") is True; parse defensively for manual/legacy JSON states.
+        ps.override_active      = _get("override_active",      _as_bool,                                        False)
         ps.override_cooldown    = _get("override_cooldown",    int,                                             0)
         ps.consecutive_failures = _get("consecutive_failures", int,                                             0)
         ps.equity_hist_cap      = _get("equity_hist_cap",      int,                                             250)
