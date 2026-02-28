@@ -537,6 +537,43 @@ def test_nan_sorting_trap_no_truncation():
         f"Expected 10 valid selections, got {len(sel_idx)} — NaN trap still active."
 
 
+def test_rebalance_prev_weights_use_last_known_price_on_nan_quote(monkeypatch):
+    """Held symbols with NaN quote on rebalance day must still contribute finite prev_weights."""
+    cfg = UltimateConfig(HISTORY_GATE=5)
+    engine = InstitutionalRiskEngine(cfg)
+    bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+
+    dates = pd.date_range("2021-01-01", periods=20, freq="B")
+    close = pd.DataFrame({"SYM00": np.linspace(100, 120, len(dates))}, index=dates)
+    volume = pd.DataFrame({"SYM00": np.ones(len(dates)) * 1e6}, index=dates)
+    returns = close.pct_change(fill_method=None).fillna(0.0)
+
+    rebalance_day = dates[-1]
+    close.loc[rebalance_day, "SYM00"] = np.nan
+
+    bt.state.shares = {"SYM00": 10}
+    bt.state.weights = {"SYM00": 0.1}
+    bt.state.last_known_prices = {"SYM00": 119.0}
+
+    captured = {}
+
+    def _fake_generate_signals(*args, **kwargs):
+        captured["prev_weights"] = kwargs.get("prev_weights", {})
+        return np.array([0.001]), np.array([1.0]), [0]
+
+    def _fake_optimize(*args, **kwargs):
+        return np.array([0.1])
+
+    monkeypatch.setattr("backtest_engine.generate_signals", _fake_generate_signals)
+    monkeypatch.setattr(bt.engine, "optimize", _fake_optimize)
+
+    bt.run(close, volume, returns, pd.DatetimeIndex([rebalance_day]), dates[0].strftime("%Y-%m-%d"))
+
+    assert "SYM00" in captured["prev_weights"]
+    assert np.isfinite(captured["prev_weights"]["SYM00"])
+    assert captured["prev_weights"]["SYM00"] > 0
+
+
 def test_volume_no_lookahead():
     from backtest_engine import _build_adv_vector
 
