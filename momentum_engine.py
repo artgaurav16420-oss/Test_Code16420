@@ -463,7 +463,28 @@ class InstitutionalRiskEngine:
         if m == 0:
             return np.array([])
 
-        clean_rets = historical_returns.ffill().dropna()
+        if len(prices) != m or len(adv_shares) != m:
+            raise OptimizationError(
+                "Input length mismatch across expected_returns/prices/adv_shares.",
+                OptimizationErrorType.DATA,
+            )
+
+        if prev_w is not None and len(prev_w) != m:
+            raise OptimizationError(
+                "prev_w length must match expected_returns length.",
+                OptimizationErrorType.DATA,
+            )
+
+        if not np.all(np.isfinite(expected_returns)):
+            raise OptimizationError("expected_returns contains non-finite values.", OptimizationErrorType.DATA)
+        if not np.all(np.isfinite(prices)) or np.any(prices <= 0):
+            raise OptimizationError("prices must be finite and strictly positive.", OptimizationErrorType.DATA)
+        if not np.all(np.isfinite(adv_shares)) or np.any(adv_shares < 0):
+            raise OptimizationError("adv_shares must be finite and non-negative.", OptimizationErrorType.DATA)
+        if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+            raise OptimizationError("portfolio_value must be finite and strictly positive.", OptimizationErrorType.DATA)
+
+        clean_rets = historical_returns.replace([np.inf, -np.inf], np.nan).ffill().dropna()
         T = len(clean_rets)
         min_rows = self.cfg.DIMENSIONALITY_MULTIPLIER * m
         if T < min_rows:

@@ -24,7 +24,7 @@ from momentum_engine import (
 )
 from backtest_engine import BacktestEngine, run_backtest, _compute_metrics, _build_adv_vector
 from universe_manager import STATIC_NSE_SECTORS
-from daily_workflow import detect_and_apply_splits, save_portfolio_state
+from daily_workflow import detect_and_apply_splits, save_portfolio_state, _normalise_start_date
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -149,6 +149,37 @@ def test_optimizer_raises_data_error_on_thin_history():
     assert exc_info.value.error_type == OptimizationErrorType.DATA
 
 
+def test_optimizer_rejects_non_finite_inputs():
+    log_rets = _make_log_rets(120, 4)
+    engine   = _make_engine()
+    with pytest.raises(OptimizationError) as exc_info:
+        engine.optimize(
+            np.array([0.001, np.nan, 0.0005, 0.0015]),
+            log_rets,
+            np.ones(4) * 1e6,
+            np.ones(4) * 200,
+            1_000_000.0,
+            exposure_multiplier=1.0,
+        )
+    assert exc_info.value.error_type == OptimizationErrorType.DATA
+
+
+def test_optimizer_rejects_prev_weights_length_mismatch():
+    log_rets = _make_log_rets(120, 4)
+    engine   = _make_engine()
+    with pytest.raises(OptimizationError) as exc_info:
+        engine.optimize(
+            np.array([0.001, 0.002, 0.0005, 0.0015]),
+            log_rets,
+            np.ones(4) * 1e6,
+            np.ones(4) * 200,
+            1_000_000.0,
+            prev_w=np.array([0.1, 0.2]),
+            exposure_multiplier=1.0,
+        )
+    assert exc_info.value.error_type == OptimizationErrorType.DATA
+
+
 def test_optimizer_adv_binding_count_populated():
     """SolverDiagnostics.adv_binding_count must not always be zero."""
     n, m = 150, 3
@@ -219,6 +250,13 @@ def test_portfolio_state_from_dict_bool_numeric_parsing():
     assert ps_false.override_active is False
     # Invalid values are reset by from_dict's guarded converter path.
     assert ps_invalid.override_active is False
+
+
+def test_normalise_start_date_default_and_validation():
+    assert _normalise_start_date("   ") == "2020-01-01"
+    assert _normalise_start_date("2024-01-31") == "2024-01-31"
+    with pytest.raises(ValueError):
+        _normalise_start_date("2024/01/31")
 
 
 def test_update_exposure_regime_bull():

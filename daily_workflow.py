@@ -549,6 +549,16 @@ def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = 
     return raw
 
 
+def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
+    """Return validated ISO date (YYYY-MM-DD), falling back to default for blank input."""
+    candidate = raw.strip() or default
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"Invalid date '{candidate}'. Expected format YYYY-MM-DD.") from exc
+    return candidate
+
+
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def main_menu() -> None:
@@ -628,7 +638,12 @@ def main_menu() -> None:
                 continue
             
             # HIGH-INTEGRITY UX FIX: Add a default fallback for the Start Date
-            start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}").strip() or "2020-01-01"
+            raw_start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}")
+            try:
+                start = _normalise_start_date(raw_start)
+            except ValueError as exc:
+                print(f"  {C.RED}{exc}{C.RST}")
+                continue
             
             if bt_c == "1":
                 universe = fetch_nse_equity_universe()
