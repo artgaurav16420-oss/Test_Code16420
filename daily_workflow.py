@@ -206,12 +206,15 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
         for r in _SPLIT_RATIOS:
             if abs(ratio - r) / r <= _SPLIT_TOLERANCE:
                 old_shares     = state.shares[sym]
-                new_shares     = int(round(old_shares * r))
+                theoretical_new_shares = old_shares * r
+                # Exchanges do not round split allotments upward.
+                # Any fractional entitlement is cash-settled by the broker/registrar.
+                new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
                 old_entry      = state.entry_prices.get(sym, current_price * r)
                 new_entry      = old_entry / r
 
-                # HIGH-INTEGRITY FIX: Fractional shares from splits gracefully return capital to Cash 
-                fractional_shares = old_shares - (new_shares / r)
+                # HIGH-INTEGRITY FIX: Fractional post-split shares are settled in cash.
+                fractional_shares = max(0.0, theoretical_new_shares - new_shares)
                 fractional_value = fractional_shares * current_price
                 state.cash = round(state.cash + fractional_value, 10)
 
