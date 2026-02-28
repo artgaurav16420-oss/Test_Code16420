@@ -203,6 +203,13 @@ def test_portfolio_state_serialisation_roundtrip():
     assert ps2.override_cooldown    == ps.override_cooldown
 
 
+def test_portfolio_state_from_dict_bool_string_parsing():
+    """String booleans from hand-edited JSON should parse as expected."""
+    ps = PortfolioState.from_dict({"override_active": "False", "override_cooldown": 2})
+    assert ps.override_active is False
+    assert ps.override_cooldown == 2
+
+
 def test_update_exposure_regime_bull():
     """Bull regime should push exposure multiplier upward."""
     cfg   = UltimateConfig()
