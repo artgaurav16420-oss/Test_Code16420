@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -59,6 +60,21 @@ class C:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _render_meter(label: str, progress: float, width: int = 30) -> str:
+    """Build a professional text meter to show long-running stage progress."""
+    clipped = max(0.0, min(1.0, progress))
+    filled = int(round(width * clipped))
+    bar = f"{'█' * filled}{'░' * (width - filled)}"
+    pct = f"{clipped * 100:5.1f}%"
+    return f"  {C.CYN}{label:<18}{C.RST} [{bar}] {C.BLD}{pct}{C.RST}"
+
+
+def _print_stage_status(label: str, progress: float, detail: str) -> None:
+    """Print stage meter and contextual status text for user visibility."""
+    print(_render_meter(label, progress))
+    print(f"  {C.GRY}{detail}{C.RST}")
 
 
 # ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
@@ -279,6 +295,9 @@ def _run_scan(
     label:    str,
     cfg_override: Optional[UltimateConfig] = None,
 ) -> tuple[PortfolioState, dict]:
+    scan_started_at = time.perf_counter()
+    _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
+
     cfg    = cfg_override if cfg_override else UltimateConfig()
     engine = InstitutionalRiskEngine(cfg)
     state.equity_hist_cap = cfg.EQUITY_HIST_CAP
@@ -287,7 +306,14 @@ def _run_scan(
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
     all_syms   = list({to_ns(t) for t in universe} | {"^NSEI", "^CRSLDX"})
+    _print_stage_status(
+        "Download",
+        0.35,
+        f"Fetching/caching OHLCV data ({start_date} → {end_date}) for {len(all_syms):,} instruments...",
+    )
     market_data = load_or_fetch(all_syms, start_date, end_date, cfg=cfg)
+    _print_stage_status("Download", 1.0, f"Data ready. Starting iteration and signal analysis for {label}.")
+    _print_stage_status("Analysis", 0.10, "Normalizing market snapshots and benchmark regime inputs...")
 
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
@@ -305,6 +331,8 @@ def _run_scan(
     if not close_d:
         logger.warning("[Scan] No data available for any universe symbol.")
         return state, market_data
+
+    _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
 
     split_syms = detect_and_apply_splits(state, market_data)
     if split_syms:
@@ -326,6 +354,7 @@ def _run_scan(
     log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
     adv_arr       = compute_adv(market_data, active)  
     prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
+    _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
 
     gross_exposure = mtm_notional / pv if pv > 0 else 1.0
     state.update_exposure(regime_score, state.realised_cvar(), cfg, gross_exposure=gross_exposure)
@@ -386,6 +415,8 @@ def _run_scan(
             date_context=pd.Timestamp(end_date), trade_log=trade_log, apply_decay=apply_decay,
         )
 
+    _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
+
     price_dict = {sym: prices[active_idx[sym]] for sym in active}
     state.record_eod(price_dict)
     final_pv = state.equity_hist[-1] if state.equity_hist else pv
@@ -400,6 +431,9 @@ def _run_scan(
         C.GRN, f"{final_pv:,.0f}", C.RST,
         C.RED, f"{total_slippage:,.0f}", C.RST,
     )
+
+    elapsed = time.perf_counter() - scan_started_at
+    _print_stage_status("Analysis", 1.0, f"{label} completed in {elapsed:.1f}s.")
     
     # ── Print Action Sheet sorted by weight for manual execution ──
     if trade_log:
