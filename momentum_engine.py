@@ -273,8 +273,10 @@ class PortfolioState:
                 if v in {"false", "0", "no", "n", "off"}:
                     return False
                 raise ValueError(f"cannot parse bool from '{value}'")
-            if isinstance(value, (int, float)):
-                return bool(value)
+            if isinstance(value, int):
+                if value in (0, 1):
+                    return bool(value)
+                raise ValueError(f"integer bool flag must be 0/1, got {value}")
             raise TypeError(f"unsupported bool type: {type(value).__name__}")
 
         def _get(key, converter, default):

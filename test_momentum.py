@@ -210,6 +210,17 @@ def test_portfolio_state_from_dict_bool_string_parsing():
     assert ps.override_cooldown == 2
 
 
+def test_portfolio_state_from_dict_bool_numeric_parsing():
+    """Legacy numeric bool flags should parse strictly for 0/1 values only."""
+    ps_true = PortfolioState.from_dict({"override_active": 1})
+    ps_false = PortfolioState.from_dict({"override_active": 0})
+    ps_invalid = PortfolioState.from_dict({"override_active": 2})
+    assert ps_true.override_active is True
+    assert ps_false.override_active is False
+    # Invalid values are reset by from_dict's guarded converter path.
+    assert ps_invalid.override_active is False
+
+
 def test_update_exposure_regime_bull():
     """Bull regime should push exposure multiplier upward."""
     cfg   = UltimateConfig()
