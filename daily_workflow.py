@@ -503,6 +503,52 @@ def _print_status(state: PortfolioState, label: str, market_data: dict) -> None:
     print(f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n")
 
 
+def _portfolio_activity_badge(state: PortfolioState) -> str:
+    """Compact portfolio activity badge for menu cards."""
+    has_activity = bool(state.shares or state.equity_hist or abs(state.cash - 1_000_000.0) >= 1.0)
+    if not has_activity:
+        return f"{C.GRY}Idle{C.RST}"
+    positions = len(state.shares)
+    return f"{C.B_GRN}Active{C.RST} {C.GRY}({positions} pos | Cash ₹{state.cash:,.0f}){C.RST}"
+
+
+def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
+    """Render a richer command palette for daily operations."""
+    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    print(f"\n{C.BLU}  ╭──────────────────────────────────────────────────────────────────────────────╮{C.RST}")
+    print(f"{C.BLU}  │{C.RST}                {C.B_CYN}ULTIMATE MOMENTUM V{__version__} — DAILY WORKFLOW{C.RST}                 {C.BLU}│{C.RST}")
+    print(f"{C.BLU}  │{C.RST}  {C.GRY}Snapshot:{C.RST} {now:<26} {C.GRY}Tip:{C.RST} Run status after each scan to review drift.{C.BLU} │{C.RST}")
+    print(f"{C.BLU}  ╰──────────────────────────────────────────────────────────────────────────────╯{C.RST}")
+
+    print(f"  {C.B_CYN}Scans & Research{C.RST}")
+    print(f"    {C.BLD}[1]{C.RST} NSE Total Scan      {C.GRY}Run full-market rebalance preview.{C.RST}")
+    print(f"    {C.BLD}[2]{C.RST} Nifty 500 Scan      {C.GRY}Focused large-cap and liquid basket.{C.RST}")
+    print(f"    {C.BLD}[3]{C.RST} Custom Screener     {C.GRY}Use Screener.in or local custom list.{C.RST}")
+    print(f"    {C.BLD}[4]{C.RST} Backtest            {C.GRY}Replay strategy performance by date.{C.RST}")
+
+    print(f"  {C.B_CYN}Portfolio Operations{C.RST}")
+    print(f"    {C.BLD}[5]{C.RST} Status              {C.GRY}Holdings table + risk diagnostics.{C.RST}")
+    print(f"    {C.BLD}[6]{C.RST} Manage Cash         {C.GRY}Deposit/withdraw portfolio cash.{C.RST}")
+    print(f"    {C.BLD}[7]{C.RST} Clear States        {C.GRY}Reset local state and cache files.{C.RST}")
+    print(f"    {C.BLD}[q]{C.RST} Quit\n")
+
+    print(f"  {C.BLD}Portfolio Health:{C.RST}")
+    print(f"    NSE Total       → {_portfolio_activity_badge(states['nse_total'])}")
+    print(f"    Nifty 500       → {_portfolio_activity_badge(states['nifty'])}")
+    print(f"    Custom Screener → {_portfolio_activity_badge(states['custom'])}")
+
+
+def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = None) -> str:
+    """Prompt for menu input with validation and optional default."""
+    raw = input(prompt).strip().lower()
+    if not raw and default is not None:
+        return default
+    if raw not in valid:
+        print(f"  {C.RED}Invalid choice. Valid options: {', '.join(valid)}{C.RST}")
+        return ""
+    return raw
+
+
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def main_menu() -> None:
@@ -514,14 +560,11 @@ def main_menu() -> None:
     mkt_cache: dict = {"nse_total": {}, "nifty": {}, "custom": {}}
 
     while True:
-        print(f"\n{C.BLU}  ╭────────────────────────────────────────────────────────────╮{C.RST}")
-        print(f"{C.BLU}  │{C.RST}         {C.B_CYN}ULTIMATE MOMENTUM V{__version__} — DAILY WORKFLOW{C.RST}          {C.BLU}│{C.RST}")
-        print(f"{C.BLU}  ╰────────────────────────────────────────────────────────────╯{C.RST}")
-        print(f"    {C.BLD}[1]{C.RST} NSE Total Scan      {C.BLD}[2]{C.RST} Nifty 500 Scan      {C.BLD}[3]{C.RST} Custom Screener")
-        print(f"    {C.BLD}[4]{C.RST} Backtest            {C.BLD}[5]{C.RST} Status              {C.BLD}[6]{C.RST} Manage Cash")
-        print(f"    {C.BLD}[7]{C.RST} Clear States        {C.BLD}[q]{C.RST} Quit")
+        _render_main_menu(states)
 
-        c = input(f"\n  {C.CYN}Choice: {C.RST}").strip().lower()
+        c = _prompt_menu_choice(f"\n  {C.CYN}Choice: {C.RST}", ["1", "2", "3", "4", "5", "6", "7", "q"])
+        if not c:
+            continue
 
         if c == "1":
             _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
@@ -580,7 +623,9 @@ def main_menu() -> None:
         elif c == "4":
             print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
             print(f"  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
-            bt_c = input(f"  {C.CYN}Choice: {C.RST}").strip()
+            bt_c = _prompt_menu_choice(f"  {C.CYN}Choice [Default 2]: {C.RST}", ["1", "2", "3"], default="2")
+            if not bt_c:
+                continue
             
             # HIGH-INTEGRITY UX FIX: Add a default fallback for the Start Date
             start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}").strip() or "2020-01-01"
@@ -619,7 +664,9 @@ def main_menu() -> None:
         elif c == "6":
             print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
             print(f"  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
-            p_c = input(f"  {C.CYN}Choice: {C.RST}").strip()
+            p_c = _prompt_menu_choice(f"  {C.CYN}Choice: {C.RST}", ["1", "2", "3"])
+            if not p_c:
+                continue
             p_map = {"1": "nse_total", "2": "nifty", "3": "custom"}
             if p_c in p_map:
                 name = p_map[p_c]
