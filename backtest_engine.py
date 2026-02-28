@@ -79,9 +79,11 @@ class BacktestEngine:
             # Current PV for logging (execute_rebalance will recompute internally).
             active_idx = {sym: i for i, sym in enumerate(symbols)}
             pv = self.state.cash + sum(
-                self.state.shares.get(sym, 0) * prices_t[active_idx[sym]]
+                self.state.shares.get(sym, 0) * (
+                    float(close_t[sym]) if pd.notna(close_t[sym]) else self.state.last_known_prices.get(sym, 0.0)
+                )
                 for sym in self.state.shares
-                if sym in active_idx and pd.notna(close_t[sym])
+                if sym in active_idx
             )
 
             if date in rebalance_dates:
@@ -126,9 +128,15 @@ class BacktestEngine:
         adv_vector = _build_adv_vector(symbols, volume, date)
 
         prev_w_dict = {
-            sym: (self.state.shares.get(sym, 0) * float(close.loc[date, sym])) / pv
+            sym: (self.state.shares.get(sym, 0) * px) / pv
             for sym in symbols
             if self.state.shares.get(sym, 0) > 0 and pv > 0
+            for px in [
+                float(close.loc[date, sym])
+                if pd.notna(close.loc[date, sym])
+                else self.state.last_known_prices.get(sym)
+            ]
+            if px is not None and np.isfinite(px)
         }
 
         raw_daily, adj_scores, sel_idx = generate_signals(
@@ -147,9 +155,13 @@ class BacktestEngine:
 
         realised_cvar = self.state.realised_cvar()
         gross_exposure = sum(
-            self.state.shares.get(sym, 0) * float(close.loc[date, sym])
+            self.state.shares.get(sym, 0) * (
+                float(close.loc[date, sym])
+                if pd.notna(close.loc[date, sym])
+                else self.state.last_known_prices.get(sym, 0.0)
+            )
             for sym in self.state.shares
-            if sym in symbols and pd.notna(close.loc[date, sym])
+            if sym in symbols
         ) / max(pv, 1e-6)
         self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
 
