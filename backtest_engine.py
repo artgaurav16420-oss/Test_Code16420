@@ -80,10 +80,11 @@ class BacktestEngine:
             active_idx = {sym: i for i, sym in enumerate(symbols)}
             pv = self.state.cash + sum(
                 self.state.shares.get(sym, 0) * (
-                    float(close_t[sym]) if pd.notna(close_t[sym]) else self.state.last_known_prices.get(sym, 0.0)
+                    float(close_t[sym])
+                    if (sym in active_idx and pd.notna(close_t[sym]))
+                    else self.state.last_known_prices.get(sym, 0.0)
                 )
                 for sym in self.state.shares
-                if sym in active_idx
             )
 
             if date in rebalance_dates:
