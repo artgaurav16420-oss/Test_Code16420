@@ -1,29 +1,20 @@
 """
 data_cache.py — Persistent Atomic Downloader
-============================================
-v11.9 — Final Hardened Release
-
-Full audit history of corrections applied across all review passes:
-
-v11.2  Dynamic MultiIndex level parsing: _extract_ticker_df checks both
-       Level 0 and Level 1 for the ticker symbol, resolving a silent drop
-       bug where yfinance's group_by="ticker" placed tickers at Level 0
-       but the previous hardcoded extractor only checked Level 1.
-v11.6  Atomic parquet writes: each ticker file is written to a .tmp path
-       first and then renamed atomically via os.replace(), preventing
-       silent cache corruption if the process is interrupted mid-write.
-       Warning logged when the returned universe is smaller than requested
-       so callers are aware of a reduced universe.
-v11.9  Data coverage validation: Cache now specifically tracks `covered_start`
-       so historical backtests correctly force a re-download if the existing
-       cache was populated by a shallow daily live scan request.
+=============================================
+Parquet-backed cache with atomic writes, manifest tracking,
+and exponential-backoff retry on yfinance failures.
 """
 
-import os
+from __future__ import annotations
+
 import json
 import logging
+import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import yfinance as yf
@@ -32,6 +23,8 @@ logger        = logging.getLogger(__name__)
 CACHE_DIR     = "data/cache"
 MANIFEST_FILE = os.path.join(CACHE_DIR, "_manifest.json")
 
+
+# ─── Manifest helpers ─────────────────────────────────────────────────────────
 
 def _load_manifest() -> dict:
     if not os.path.exists(MANIFEST_FILE):
@@ -51,67 +44,82 @@ def _save_manifest(m: dict) -> None:
     os.replace(tmp, MANIFEST_FILE)
 
 
-def _extract_ticker_df(
-    raw: pd.DataFrame, ticker: str, is_multi: bool
-) -> pd.DataFrame:
-    """
-    Robustly extract a single ticker's OHLCV DataFrame from a yfinance
-    batch download result, dynamically locating the ticker in either
-    MultiIndex level.
-    """
+# ─── yfinance extraction helpers ─────────────────────────────────────────────
+
+def _extract_ticker_df(raw: pd.DataFrame, ticker: str, is_multi: bool) -> Optional[pd.DataFrame]:
     if not is_multi:
         return raw.copy()
-
     try:
-        if ticker in raw.columns.get_level_values(0):
+        levels = raw.columns.get_level_values
+        if ticker in levels(0):
             return raw[ticker].copy()
-        elif ticker in raw.columns.get_level_values(1):
+        if ticker in levels(1):
             return raw.xs(ticker, axis=1, level=1).copy()
-    except Exception as e:
-        logger.debug(f"[Cache] Extraction error for {ticker}: {e}")
-
+    except Exception as exc:
+        logger.debug("[Cache] Extraction error for %s: %s", ticker, exc)
     return None
 
+
+# ─── Public interface ─────────────────────────────────────────────────────────
 
 def load_or_fetch(
     tickers:        List[str],
     required_start: str,
     required_end:   str,
     force_refresh:  bool = False,
+    cfg=None,
 ) -> Dict[str, pd.DataFrame]:
+    """
+    Return a {ticker: OHLCV DataFrame} mapping.
+
+    Tickers are normalised to .NS suffix before caching.  All files are
+    written atomically (tmp → replace) so a crash mid-write never leaves a
+    corrupt parquet on disk.
+    """
+    yf_timeout = getattr(cfg, "YF_BATCH_TIMEOUT", 120.0)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     manifest = _load_manifest()
 
-    # Normalise ticker symbols: indices keep '^', equities get '.NS'.
     standard_tickers = list({
         t if (t.endswith(".NS") or t.startswith("^")) else t + ".NS"
         for t in tickers
     })
 
-    fetch_start = (
-        pd.Timestamp(required_start) - timedelta(days=400)
-    ).strftime("%Y-%m-%d")
+    # HIGH-INTEGRITY FIX: Backend defensive fallback to prevent NaT (Not a Time) crashes
+    # if an empty string ever bypasses the UI layer.
+    if not required_start or str(required_start).strip() == "":
+        required_start = "2020-01-01"
 
-    to_download = []
-    market_data = {}
+    fetch_start = (pd.Timestamp(required_start) - timedelta(days=400)).strftime("%Y-%m-%d")
+    
+    # Calculate the last valid business day to ensure we don't treat data from Friday 
+    # as fresh on a Monday morning when Monday's data is actually missing.
+    today_bday = (pd.Timestamp.today().normalize() - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+
+    to_download: List[str]         = []
+    market_data: Dict[str, pd.DataFrame] = {}
 
     for t in standard_tickers:
         entry         = manifest.get(t, {})
         fetched_at    = entry.get("fetched_at", "2000-01-01")
-        # `covered_start` tracks the depth we previously asked yfinance for. 
-        # Resolves the bug where cache hits falsely satisfy deep historical backtest requests.
         covered_start = entry.get("covered_start", entry.get("first_date", "2099-01-01"))
+        last_date     = entry.get("last_date", "2000-01-01")
         
-        stale = (
-            datetime.now() - datetime.fromisoformat(fetched_at) > timedelta(hours=20)
-        )
-        parquet_path = os.path.join(CACHE_DIR, f"{t}.parquet")
+        stale_time    = (datetime.now() - datetime.fromisoformat(fetched_at)) > timedelta(hours=20)
+        stale_bday    = last_date < today_bday
+        
+        parquet_path  = os.path.join(CACHE_DIR, f"{t}.parquet")
 
-        if force_refresh or stale or not os.path.exists(parquet_path):
-            to_download.append(t)
-        elif pd.Timestamp(covered_start) > pd.Timestamp(fetch_start):
-            # Cache is fresh but too shallow to satisfy the historical request.
+        needs_download = (
+            force_refresh
+            or stale_time
+            or stale_bday
+            or not os.path.exists(parquet_path)
+            or pd.Timestamp(covered_start) > pd.Timestamp(fetch_start)
+        )
+        
+        if needs_download:
             to_download.append(t)
         else:
             try:
@@ -121,64 +129,90 @@ def load_or_fetch(
 
     if to_download:
         logger.info(
-            f"[Cache] Batch downloading {len(to_download)} tickers "
-            f"({fetch_start} → {required_end}) ..."
+            "[Cache] Batch downloading %d tickers (%s → %s) ...",
+            len(to_download), fetch_start, required_end,
         )
-        raw = yf.download(
-            to_download,
-            start=fetch_start,
-            end=required_end,
-            group_by="ticker",
-            progress=True,
-            auto_adjust=True,
-        )
-
-        is_multi = isinstance(raw.columns, pd.MultiIndex)
-        now      = datetime.now().isoformat()
-
-        for t in to_download:
-            try:
-                df = _extract_ticker_df(raw, t, is_multi)
-
-                if df is None or df.empty or len(df) < 5:
-                    logger.debug(f"[Cache] Skipping {t}: no usable data returned.")
-                    continue
-
-                if getattr(df.index, "tz", None):
-                    df.index = df.index.tz_convert(None)
-
-                df = df.dropna(how="all")
-
-                # Atomic write: commit to .tmp then rename so a crash never
-                # leaves a partial file that would be read as valid on restart.
-                path     = os.path.join(CACHE_DIR, f"{t}.parquet")
-                tmp_path = path + ".tmp"
-                df.to_parquet(tmp_path)
-                os.replace(tmp_path, path)
-
-                market_data[t] = df
-                manifest[t]    = {
-                    "fetched_at":    now,
-                    "rows":          len(df),
-                    "first_date":    df.index[0].strftime("%Y-%m-%d"),
-                    "last_date":     df.index[-1].strftime("%Y-%m-%d"),
-                    "covered_start": fetch_start, # Validates future depth checks 
-                }
-
-            except Exception as e:
-                logger.warning(f"[Cache] Failed to process {t}: {e}")
+        raw = _download_with_retry(to_download, fetch_start, required_end, yf_timeout)
+        _ingest_raw(raw, to_download, manifest, market_data, fetch_start)
 
     _save_manifest(manifest)
 
     missing = set(standard_tickers) - set(market_data.keys())
     if missing:
-        logger.warning(
-            f"[Cache] {len(missing)} ticker(s) unavailable — portfolio will run "
-            f"with reduced universe. Missing: {sorted(missing)}"
-        )
+        logger.warning("[Cache] %d ticker(s) unavailable: %s", len(missing), sorted(missing))
 
     return market_data
 
+
+def _download_with_retry(
+    tickers:     List[str],
+    start:       str,
+    end:         str,
+    timeout:     float,
+) -> pd.DataFrame:
+    def _do() -> pd.DataFrame:
+        for attempt in range(3):
+            try:
+                return yf.download(
+                    tickers, start=start, end=end,
+                    group_by="ticker", progress=False, auto_adjust=True,
+                )
+            except Exception as exc:
+                if attempt == 2:
+                    raise exc
+                logger.debug("[Cache] Download attempt %d failed; retrying.", attempt + 1)
+                time.sleep((2 ** attempt) + random.uniform(0, 1))
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_do).result(timeout=timeout)
+    except Exception as exc:
+        logger.error("[Cache] Download failed or timed out: %s. Using cached data.", exc)
+        return pd.DataFrame()
+
+
+def _ingest_raw(
+    raw:         pd.DataFrame,
+    to_download: List[str],
+    manifest:    dict,
+    market_data: dict,
+    fetch_start: str,
+) -> None:
+    if raw.empty:
+        logger.warning("[Cache] Download returned empty DataFrame.")
+        return
+
+    is_multi = isinstance(raw.columns, pd.MultiIndex)
+    now      = datetime.now().isoformat()
+
+    for t in to_download:
+        try:
+            df = _extract_ticker_df(raw, t, is_multi)
+            if df is None or df.empty or len(df) < 5:
+                continue
+
+            if getattr(df.index, "tz", None):
+                df.index = df.index.tz_convert(None)
+            df = df.dropna(how="all")
+
+            path     = os.path.join(CACHE_DIR, f"{t}.parquet")
+            tmp_path = path + ".tmp"
+            df.to_parquet(tmp_path)
+            os.replace(tmp_path, path)
+
+            market_data[t] = df
+            manifest[t]    = {
+                "fetched_at":    now,
+                "rows":          len(df),
+                "first_date":    df.index[0].strftime("%Y-%m-%d"),
+                "last_date":     df.index[-1].strftime("%Y-%m-%d"),
+                "covered_start": fetch_start,
+            }
+        except Exception as exc:
+            logger.warning("[Cache] Failed to process %s: %s", t, exc)
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
 
 def get_cache_summary() -> pd.DataFrame:
     m = _load_manifest()

@@ -1,309 +1,668 @@
 """
-daily_workflow.py — Ultimate Momentum V11 Daily Workflow
-=========================================================
-v11.9 — Final Hardened Release
-
-Full audit history of corrections applied across all review passes:
-
-v11.5  Memory isolation: main_menu() uses a dictionary of independent
-       PortfolioStates so switching between universes does not
-       cross-contaminate or liquidate holdings from the other universe.
-v11.6  PortfolioState dict migration: weights and shares moved from
-       positional numpy arrays to {symbol: value} dicts, eliminating
-       index-alignment drift when the universe composition shifts.
-       Mark-to-market equity: current_portfolio_value derived from live
-       MTM equity (shares × prices + cash) rather than a static anchor.
-       Output sort: active holdings displayed in descending weight order.
-v11.7  Pre-IPO masking parity: HISTORY_GATE check and NaN-to-(-inf)
-       masking added to the live scan ranking block, matching the
-       correction applied to the backtest engine in v11.5.
-       Early guard ordering: len(sel_idx) == 0 check moved above the
-       dependent sel_syms and np.sort calls, guarded via len() before
-       any numpy array conversion occurs.
-v11.8  SIGNAL_ANNUAL_FACTOR rename: cfg.ANNUAL_FACTOR renamed to
-       cfg.SIGNAL_ANNUAL_FACTOR to distinguish signal-plane annualisation
-       (252 trading days) from the dynamic Sharpe obs_per_year introduced
-       in backtest_engine v11.7.
-v11.9  Diagnostic UI: 'Compression Ratio' explicitly renamed to 
-       'Budget Utilisation' to clarify situations where the allocated capital
-       naturally scales up to the regime elasticity bounds.
+daily_workflow.py — Ultimate Momentum — Daily Workflow
+=======================================================
+Interactive CLI for live scanning, status display, and backtesting.
+Features robust capital management and direct Screener.in web scraping.
 """
 
+from __future__ import annotations
+
+import copy
+import json
 import logging
 import os
-import sys
-from dataclasses import dataclass, field
+import shutil
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import numpy as np
 import pandas as pd
 
-from ultimate_momentum_v10_hardened import InstitutionalRiskEngine, UltimateConfig
-from universe_manager import fetch_screener_universe, get_nifty500, invalidate_universe_cache
+from momentum_engine import (
+    InstitutionalRiskEngine,
+    UltimateConfig,
+    OptimizationError,
+    OptimizationErrorType,
+    PortfolioState,
+    execute_rebalance,
+    to_ns,
+    to_bare,
+    Trade,
+)
+from universe_manager import (
+    fetch_nse_equity_universe,
+    get_nifty500,
+    get_sector_map,
+    invalidate_universe_cache,
+)
 from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
+from signals import generate_signals, compute_adv, compute_regime_score
 
-SCREENER_URL = "https://www.screener.in/screens/3506127/hello/"
+__version__ = "11.42"
+
+# ─── ANSI colour palette ─────────────────────────────────────────────────────
+
+class C:
+    BLU   = "\033[34m"
+    CYN   = "\033[36m"
+    GRN   = "\033[32m"
+    YLW   = "\033[33m"
+    RED   = "\033[31m"
+    GRY   = "\033[90m"
+    RST   = "\033[0m"
+    BLD   = "\033[1m"
+    B_CYN = "\033[1;36m"
+    B_GRN = "\033[1;32m"
+    B_RED = "\033[1;31m"
 
 
-def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-
-_setup_logging()
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PortfolioState:
-    weights:     Dict[str, float] = field(default_factory=dict)
-    shares:      Dict[str, int]   = field(default_factory=dict)
-    equity_hist: List[float]      = field(default_factory=list)
-    universe:    List[str]        = field(default_factory=list)
-    cash:        float            = field(default_factory=lambda: UltimateConfig().INITIAL_CAPITAL)
+# ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
 
-    def realised_cvar(self) -> float:
-        """CVaR at 95% confidence computed from the running MTM equity history."""
-        if len(self.equity_hist) < 30:
-            return 0.0
-        rets  = pd.Series(self.equity_hist).pct_change().dropna()
-        var_q = rets.quantile(0.05)
-        tail  = rets[rets <= var_q]
-        return max(0.0, -float(tail.mean())) if not tail.empty else 0.0
+def _scrape_screener(base_url: str) -> List[str]:
+    """Handles pagination to scrape all tickers from a public Screener.in URL."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        import re
+    except ImportError:
+        print(f"\n  {C.RED}[!] Missing dependencies for web scraping.{C.RST}")
+        print(f"  {C.GRY}Please run: pip install requests beautifulsoup4{C.RST}\n")
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    
+    symbols = set()
+    page = 1
+    
+    # HIGH-INTEGRITY FIX: Use proper URL parsing to remove only 'page' and preserve other screener filters
+    parsed = urlparse(base_url)
+    qs = parse_qs(parsed.query)
+    qs.pop('page', None)
+    clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+    
+    while True:
+        sep = "&" if "?" in clean_url else "?"
+        url = f"{clean_url}{sep}page={page}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+        except requests.RequestException as e:
+            logger.error("[Screener] Network error while reaching Screener.in: %s", e)
+            break
+
+        if resp.status_code in (401, 403):
+            print(f"\n  {C.RED}[!] Screener.in denied access (HTTP {resp.status_code}).{C.RST}")
+            print(f"  {C.GRY}Verify the screen is marked Public at:{C.RST}")
+            print(f"  {C.GRY}screener.in → Your Screen → Edit → Visibility: Public{C.RST}\n")
+            break
+        elif resp.status_code != 200:
+            break
+            
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        links = soup.find_all('a', href=re.compile(r'^/company/[^/]+/(?:consolidated/)?$'))
+        
+        page_symbols = 0
+        for link in links:
+            match = re.search(r'/company/([^/]+)/', link['href'])
+            if match:
+                sym = match.group(1).upper()
+                symbols.add(sym)
+                page_symbols += 1
+                
+        # Break loop if we hit a page with no new symbols
+        if page_symbols == 0:
+            break
+            
+        page += 1
+        
+    return list(symbols)
 
 
-def _run_scan(universe: List[str], state: PortfolioState, label: str) -> PortfolioState:
-    cfg    = UltimateConfig()
+def _get_custom_universe() -> List[str]:
+    """Automatically gets universe from Screener.in URL or local fallback."""
+    DEFAULT_URL = "https://www.screener.in/screens/3506127/hello/"
+    url_file = "data/screener_url.txt"
+    
+    saved_url = DEFAULT_URL
+    if os.path.exists(url_file):
+        with open(url_file, "r") as f:
+            content = f.read().strip()
+            if content:
+                saved_url = content
+    else:
+        # Save the default URL so it can be manually edited later if needed
+        os.makedirs("data", exist_ok=True)
+        with open(url_file, "w") as f:
+            f.write(DEFAULT_URL)
+            
+    print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
+    logger.info("[Screener] Fetching universe from: %s", saved_url)
+    
+    tickers = _scrape_screener(saved_url)
+    if tickers:
+        return tickers
+        
+    logger.warning("[Screener] Scraping failed or returned 0 tickers. Attempting local file fallback...")
+
+    # Fallback to local files
+    files = ["custom_screener.csv", "custom_screener.txt"]
+    for f in files:
+        if os.path.exists(f):
+            try:
+                with open(f, "r") as file:
+                    content = file.read().replace(",", "\n")
+                    tickers = [line.strip().upper() for line in content.split("\n") if line.strip()]
+                    tickers = [t for t in tickers if t not in ("SYMBOL", "TICKER", "")]
+                    return list(set(tickers))
+            except Exception as e:
+                logger.error("[Screener] Failed to read %s: %s", f, e)
+    return []
+
+
+def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
+    """Prompts for real-world capital if the portfolio is brand new."""
+    if not state.shares and not state.equity_hist and abs(state.cash - 1_000_000.0) < 1.0:
+        print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
+        try:
+            raw_cap = input(f"  {C.CYN}Enter your starting capital (₹) [Default 10,00,000]: {C.RST}").replace(",", "").strip()
+            if raw_cap:
+                cap = float(raw_cap)
+                if cap > 0:
+                    state.cash = cap
+                    save_portfolio_state(state, name)
+                    print(f"  {C.GRN}[+] Initial capital set to ₹{cap:,.2f}{C.RST}\n")
+        except ValueError:
+            print(f"  {C.RED}Invalid input. Using default ₹10,00,000.{C.RST}\n")
+
+
+# ─── Corporate action / split detection ──────────────────────────────────────
+
+_SPLIT_RATIOS = [2, 5, 10, 3, 4, 20, 0.5, 0.2]
+_SPLIT_TOLERANCE = 0.04   
+
+
+def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[str]:
+    adjusted: List[str] = []
+    for sym in list(state.shares.keys()):
+        ns = to_ns(sym)
+        if ns not in market_data or market_data[ns].empty:
+            continue
+        current_price = float(market_data[ns]["Close"].iloc[-1])
+        if not np.isfinite(current_price) or current_price <= 0:
+            continue
+        last_price = state.last_known_prices.get(sym)
+        if last_price is None or last_price <= 0:
+            continue
+
+        ratio = last_price / current_price
+
+        for r in _SPLIT_RATIOS:
+            if abs(ratio - r) / r <= _SPLIT_TOLERANCE:
+                old_shares     = state.shares[sym]
+                new_shares     = int(round(old_shares * r))
+                old_entry      = state.entry_prices.get(sym, current_price * r)
+                new_entry      = old_entry / r
+
+                # HIGH-INTEGRITY FIX: Fractional shares from splits gracefully return capital to Cash 
+                fractional_shares = old_shares - (new_shares / r)
+                fractional_value = fractional_shares * current_price
+                state.cash = round(state.cash + fractional_value, 10)
+
+                logger.warning(
+                    "SPLIT DETECTED: %s  ratio=%.3f (≈%gx)  "
+                    "shares %d→%d  entry_price ₹%.2f→₹%.2f",
+                    sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
+                )
+                state.shares[sym]       = new_shares
+                state.entry_prices[sym] = round(new_entry, 4)
+                state.last_known_prices[sym] = current_price
+                adjusted.append(sym)
+                break
+
+    return adjusted
+
+
+# ─── State persistence ────────────────────────────────────────────────────────
+
+def save_portfolio_state(state: PortfolioState, name: str) -> None:
+    os.makedirs("data", exist_ok=True)
+    state_file = f"data/portfolio_state_{name}.json"
+    tmp_file   = f"{state_file}.tmp"
+    try:
+        for i in range(1, -1, -1):
+            src, dst = f"{state_file}.bak.{i}", f"{state_file}.bak.{i+1}"
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+        if os.path.exists(state_file):
+            shutil.copy2(state_file, f"{state_file}.bak.0")
+        with open(tmp_file, "w") as f:
+            json.dump(state.to_dict(), f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, state_file)
+        if os.name == "posix":
+            dir_fd = os.open("data", os.O_DIRECTORY)
+            os.fsync(dir_fd)
+            os.close(dir_fd)
+    except Exception as exc:
+        logger.error("Durable save failed for '%s': %s", name, exc)
+
+
+def load_portfolio_state(name: str) -> PortfolioState:
+    state_file = f"data/portfolio_state_{name}.json"
+    backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(3)]
+    for path in backups:
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    return PortfolioState.from_dict(json.load(f))
+            except Exception as exc:
+                logger.warning("Corrupted state at %s: %s", path, exc)
+    return PortfolioState()
+
+
+# ─── Core scan logic ──────────────────────────────────────────────────────────
+
+def _run_scan(
+    universe: List[str],
+    state:    PortfolioState,
+    label:    str,
+    cfg_override: Optional[UltimateConfig] = None,
+) -> tuple[PortfolioState, dict]:
+    cfg    = cfg_override if cfg_override else UltimateConfig()
     engine = InstitutionalRiskEngine(cfg)
+    state.equity_hist_cap = cfg.EQUITY_HIST_CAP
 
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
-    all_syms    = list(
-        {t if t.endswith(".NS") else t + ".NS" for t in universe} | {"^NSEI", "^CRSLDX"}
-    )
-    market_data = load_or_fetch(all_syms, start_date, end_date)
+    all_syms   = list({to_ns(t) for t in universe} | {"^NSEI", "^CRSLDX"})
+    market_data = load_or_fetch(all_syms, start_date, end_date, cfg=cfg)
 
-    # ── 1. Regime detection ───────────────────────────────────────────────────
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
         idx_df = market_data.get("^NSEI")
+        
+    idx_slice   = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
+    regime_score = compute_regime_score(idx_slice)
 
-    regime_score = 0.5
-    regime_label = "🟡 Neutral"
-    if idx_df is not None and len(idx_df) > 200:
-        sma200       = idx_df["Close"].rolling(200).mean().iloc[-1]
-        last         = idx_df["Close"].iloc[-1]
-        regime_score = float(1.0 / (1.0 + np.exp(-20.0 * (float(last / sma200) - 1.0))))
-        regime_label = (
-            "🟢 Bull"    if regime_score > 0.6 else
-            "🔴 Bear"    if regime_score < 0.4 else
-            "🟡 Neutral"
-        )
-
-    # ── 2. Data alignment and cleaning ───────────────────────────────────────
-    close_d = {}
+    close_d: Dict[str, pd.Series] = {}
     for sym in universe:
-        ns = sym if sym.endswith(".NS") else sym + ".NS"
-        df = market_data.get(ns)
-        if df is not None and len(df) >= cfg.HISTORY_GATE:
-            close_d[sym] = df["Close"].ffill()
+        ns = to_ns(sym)
+        if ns in market_data:
+            close_d[to_bare(ns)] = market_data[ns]["Close"].ffill()
 
     if not close_d:
-        print("  ❌ No valid tickers with sufficient history found.")
-        return state
+        logger.warning("[Scan] No data available for any universe symbol.")
+        return state, market_data
 
-    close     = pd.DataFrame(close_d).sort_index()
-    log_rets  = np.log1p(close.pct_change().clip(lower=-0.99)).replace(
-        [np.inf, -np.inf], np.nan
-    )
-    hist_rets = log_rets.dropna(how="all")
-    active    = list(close.columns)
-    prices    = close.iloc[-1].values.astype(float)
+    split_syms = detect_and_apply_splits(state, market_data)
+    if split_syms:
+        logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
 
-    adv_arr = np.zeros(len(active))
-    for i, sym in enumerate(active):
-        ns = sym if sym.endswith(".NS") else sym + ".NS"
-        df = market_data.get(ns)
-        if df is not None and "Volume" in df.columns and len(df) >= 20:
-            sma20 = df["Volume"].rolling(20).mean().iloc[-1]
-            spot  = df["Volume"].iloc[-1]
-            if not pd.isna(sma20) and not pd.isna(spot):
-                adv_arr[i] = float(min(sma20, spot))
+    close    = pd.DataFrame(close_d).sort_index()
+    active   = list(close.columns)          
+    prices   = close.iloc[-1].values.astype(float)
+    active_idx = {sym: i for i, sym in enumerate(active)}
 
-    # ── 3. Mark-to-market equity via symbol-keyed dict ────────────────────────
-    # Shares are stored by ticker name, so universe composition shifts never
-    # cause a positional index mismatch.
-    active_idx   = {sym: i for i, sym in enumerate(active)}
     mtm_notional = sum(
-        count * prices[active_idx[sym]]
-        for sym, count in state.shares.items()
+        state.shares.get(sym, 0) * prices[active_idx[sym]]
+        for sym in state.shares
         if sym in active_idx
     )
-    current_portfolio_value = mtm_notional + state.cash
+    pv = mtm_notional + state.cash
 
-    # ── 4. Signal ranking with hysteresis and Pre-IPO masking ─────────────────
-    valid_counts = hist_rets.notna().sum().values
-    raw_daily    = hist_rets.ewm(halflife=63).mean().iloc[-1].values
-    raw_annual   = raw_daily * cfg.SIGNAL_ANNUAL_FACTOR
+    close_hist    = close.iloc[:-1]   
+    log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
+    adv_arr       = compute_adv(market_data, active)  
+    prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
 
-    mu, std   = np.nanmean(raw_daily), max(np.nanstd(raw_daily), 1e-8)
-    exp_rets  = np.clip((raw_daily - mu) / std, -3.0, 3.0)
-    adj_scores = exp_rets.copy()
+    gross_exposure = mtm_notional / pv if pv > 0 else 1.0
+    state.update_exposure(regime_score, state.realised_cvar(), cfg, gross_exposure=gross_exposure)
 
-    for i, sym in enumerate(active):
-        if state.weights.get(sym, 0.0) > 0.001:
-            adj_scores[i] += 0.05  # Retention bonus for existing holdings
+    weights              = np.zeros(len(active))
+    apply_decay          = False
+    optimization_succeeded = False
+    total_slippage       = 0.0
+    trade_log: List[Trade] = []
 
-        # Mask pre-IPO stocks and any stock with insufficient return history.
-        if valid_counts[i] < cfg.HISTORY_GATE or np.isnan(adj_scores[i]):
-            adj_scores[i] = -np.inf
+    try:
+        raw_daily, adj_scores, sel_idx = generate_signals(
+            log_rets, adv_arr, cfg.HISTORY_GATE, cfg.MAX_POSITIONS,
+            prev_weights=state.weights,   
+            halflife_fast=cfg.HALFLIFE_FAST,
+            halflife_slow=cfg.HALFLIFE_SLOW,
+        )
+        if not sel_idx:
+            raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
 
-    k          = cfg.MAX_POSITIONS
-    sorted_idx = np.argsort(adj_scores)
-    sel_idx    = [i for i in sorted_idx[-k:] if adj_scores[i] > -np.inf]
+        sel_syms      = [active[i] for i in sel_idx]
+        sector_map    = get_sector_map(sel_syms, cfg=cfg)
+        unique_sectors = sorted(set(sector_map.values()))
+        sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
+        sector_labels  = np.array([sec_idx[sector_map[sym]] for sym in sel_syms], dtype=int)
 
-    # Guard checked via len() while sel_idx is still a plain list.
-    if len(sel_idx) == 0:
-        logger.warning("No valid tickers survived ranking criteria.")
-        return state
+        weights_sel = engine.optimize(
+            expected_returns    = raw_daily[sel_idx],
+            historical_returns  = log_rets[[active[i] for i in sel_idx]],
+            adv_shares          = adv_arr[sel_idx],
+            prices              = prices[sel_idx],
+            portfolio_value     = pv,
+            prev_w              = prev_w_arr[sel_idx],
+            exposure_multiplier = state.exposure_multiplier,
+            sector_labels       = sector_labels,
+        )
+        weights[sel_idx]               = weights_sel
+        state.consecutive_failures     = 0
+        state.decay_rounds             = 0   
+        optimization_succeeded         = True
 
-    sel_idx  = np.sort(sel_idx)
-    sel_syms = [active[i] for i in sel_idx]
+    except OptimizationError as exc:
+        if exc.error_type != OptimizationErrorType.DATA:
+            state.consecutive_failures += 1
+            logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
+            if state.consecutive_failures >= 2:
+                logger.warning(
+                    "Regime decay: forcing -%.0f%% exposure reduction.",
+                    (1 - cfg.DECAY_FACTOR) * 100,
+                )
+                apply_decay = True
+        else:
+            logger.error("Data error (not escalated): %s. Freezing state.", exc)
 
-    # ── 5. Optimizer execution ────────────────────────────────────────────────
-    prev_w_slice = np.array([state.weights.get(sym, 0.0) for sym in sel_syms])
-    engine.calculate_exposure_multiplier(regime_score, state.realised_cvar())
-
-    weights_sel = engine.optimize(
-        expected_returns   = raw_daily[sel_idx],
-        historical_returns = hist_rets[sel_syms],
-        adv_shares         = adv_arr[sel_idx],
-        prices             = prices[sel_idx],
-        portfolio_value    = current_portfolio_value,
-        prev_w             = prev_w_slice,
-    )
-
-    weights          = np.zeros(len(active))
-    weights[sel_idx] = weights_sel
-
-    # ── 6. Remap results to symbol-keyed dicts ────────────────────────────────
-    new_weights     = {}
-    new_shares      = {}
-    actual_notional = 0.0
-
-    for i in range(len(active)):
-        if weights[i] > 0:
-            sym = active[i]
-            s   = int(np.floor(weights[i] * current_portfolio_value / max(prices[i], 1e-6)))
-            if s > 0:
-                new_weights[sym]  = weights[i]
-                new_shares[sym]   = s
-                actual_notional  += s * prices[i]
-
-    residual_cash = current_portfolio_value - actual_notional
-    total_equity  = actual_notional + residual_cash
-
-    state.weights     = new_weights
-    state.shares      = new_shares
-    state.universe    = active
-    state.cash        = residual_cash
-    state.equity_hist.append(total_equity)
-
-    # ── 7. Formatted output ───────────────────────────────────────────────────
-    diag = engine.last_diag
-    print(f"\n{'='*72}")
-    print(f"  {label}")
-    print(f"{'='*72}")
-    print(f"  Regime: {regime_score:.2f} {regime_label} | CVaR: {state.realised_cvar():.2%}")
-    if diag:
-        print(f"\n  GOVERNANCE & RISK AUDIT")
-        print(f"  {'─'*30}")
-        print(f"  Solver Status     : {diag.status}")
-        print(f"  Regime Intent (γ) : {diag.gamma_intent:.2f}")
-        print(f"  Actual Exposure   : {diag.actual_weight:.3f}")
-        print(f"  Budget Utilisation: {diag.budget_utilisation:.1%}")
-        print(f"  ADV Saturation    : {diag.adv_binding_count} stocks at hard limit")
-
-    print(f"\n  {'Stock (Price)':<22} {'Weight':>7}  {'Shares':>8}  {'Notional':>12}  {'Exp Ret'}")
-    print(f"  {'─'*68}")
-
-    display_rows = []
-    for sym, count in state.shares.items():
-        i            = active_idx[sym]
-        display_name = f"{sym} ({prices[i]:,.1f})"
-        notional     = count * prices[i]
-        exp_ret      = raw_annual[i] * 100
-        display_rows.append((state.weights[sym], display_name, count, notional, exp_ret))
-
-    display_rows.sort(key=lambda x: x[0], reverse=True)
-
-    for w_val, display_name, s_val, notional, exp_ret in display_rows:
-        print(
-            f"  {display_name:<22} {w_val:>7.2%}  {s_val:>8,}  "
-            f"₹{notional:>10,.0f}  {exp_ret:>7.1f}%"
+    if optimization_succeeded or apply_decay:
+        total_slippage = execute_rebalance(
+            state, weights, prices, active, cfg,
+            date_context=pd.Timestamp(end_date), trade_log=trade_log, apply_decay=apply_decay,
         )
 
-    print(f"  {'─'*68}")
-    print(f"  OPTIMAL TOTAL INVESTMENT : ₹{actual_notional:,.0f}")
-    print(f"  RESIDUAL CASH            : ₹{residual_cash:,.0f}")
-    print(f"  TOTAL MTM EQUITY         : ₹{total_equity:,.0f}")
-    print(f"  (Reference Anchor: ₹{cfg.INITIAL_CAPITAL:,.0f})")
-    print(f"{'='*72}\n")
-    return state
+    price_dict = {sym: prices[active_idx[sym]] for sym in active}
+    state.record_eod(price_dict)
+    final_pv = state.equity_hist[-1] if state.equity_hist else pv
+
+    logger.info(
+        "%s%s%s | Regime: %.2f | CVaR: %.2f%% | Failures: %d | "
+        "Equity: %s₹%s%s | Slippage: %s₹%s%s",
+        C.BLU, label, C.RST,
+        regime_score,
+        state.realised_cvar() * 100,
+        state.consecutive_failures,
+        C.GRN, f"{final_pv:,.0f}", C.RST,
+        C.RED, f"{total_slippage:,.0f}", C.RST,
+    )
+    
+    # ── Print Action Sheet sorted by weight for manual execution ──
+    if trade_log:
+        print(f"\n  {C.B_CYN}EXECUTION ACTION SHEET (Manual Targets){C.RST}")
+        print(f"  {C.GRY}{'─' * 66}{C.RST}")
+        
+        sorted_trades = sorted(trade_log, key=lambda t: state.weights.get(t.symbol, 0.0), reverse=True)
+        
+        for t in sorted_trades:
+            action_color = C.B_GRN if t.direction == "BUY" else C.B_RED
+            target_weight = state.weights.get(t.symbol, 0.0)
+            print(
+                f"  {action_color}{t.direction:<4}{C.RST} | {C.BLD}{t.symbol:<12}{C.RST} | "
+                f"{abs(t.delta_shares):>6,d} shares @ ≈ ₹{t.exec_price:>9,.2f} | Tgt: {C.CYN}{target_weight:>5.1%}{C.RST}"
+            )
+        print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
+
+    return state, market_data
 
 
-def main_menu():
-    # Independent state objects prevent cross-contamination between universes.
-    states = {
-        "screener": PortfolioState(),
-        "nifty":    PortfolioState(),
+# ─── Status display ───────────────────────────────────────────────────────────
+
+def _print_status(state: PortfolioState, label: str, market_data: dict) -> None:
+    print(f"\n  {C.GRY}╭{'─' * 88}╮{C.RST}")
+    print(f"  {C.GRY}│{C.BLD}  STATUS — {label}  {C.RST}{C.GRY}{' ' * (75 - len(label))}│{C.RST}")
+    print(f"  {C.GRY}╰{'─' * 88}╯{C.RST}")
+
+    if not state.shares:
+        print(f"  {C.GRY}No open positions.{C.RST}\n")
+        return
+
+    active     = list(state.shares.keys())
+    prices_now = {}
+    for sym in active:
+        ns = to_ns(sym)
+        if ns in market_data and not market_data[ns].empty:
+            prices_now[sym] = float(market_data[ns]["Close"].iloc[-1])
+
+    mtm = sum(state.shares[s] * prices_now.get(s, 0.0) for s in active)
+    pv  = mtm + state.cash
+
+    rows      = []
+    total_pnl = 0.0
+    for sym in active:
+        shares   = state.shares[sym]
+        price    = prices_now.get(sym, float("nan"))
+        entry    = state.entry_prices.get(sym, float("nan"))
+        notional = shares * price if np.isfinite(price) else 0.0
+        weight   = notional / pv if pv > 0 else 0.0
+        pnl      = (price - entry) * shares if (np.isfinite(price) and np.isfinite(entry)) else float("nan")
+        if np.isfinite(pnl):
+            total_pnl += pnl
+        rows.append({
+            "sym": sym, "shares": shares, "price": price,
+            "entry": entry, "weight": weight, "notional": notional, "pnl": pnl,
+        })
+
+    rows.sort(key=lambda x: x["weight"], reverse=True)
+    c_pipe = f"{C.GRY}│{C.RST}"
+
+    print(f"  {C.GRY}┌──────────────┬─────────┬───────────┬───────────┬────────┬─────────────┬─────────────┐{C.RST}")
+    print(
+        f"  {c_pipe} {C.B_CYN}{'Symbol':<12}{C.RST} {c_pipe} {C.B_CYN}{'Shares':>7}{C.RST} "
+        f"{c_pipe} {C.B_CYN}{'Price':>9}{C.RST} {c_pipe} {C.B_CYN}{'Entry':>9}{C.RST} "
+        f"{c_pipe} {C.B_CYN}{'Weight':>6}{C.RST} {c_pipe} {C.B_CYN}{'Notional':>11}{C.RST} "
+        f"{c_pipe} {C.B_CYN}{'Unreal P&L':>11}{C.RST} {c_pipe}"
+    )
+    print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
+
+    for r in rows:
+        pnl_raw   = f"₹{r['pnl']:+,.0f}" if np.isfinite(r["pnl"]) else "n/a"
+        pnl_color = C.B_GRN if r["pnl"] > 0 else (C.B_RED if r["pnl"] < 0 else C.RST)
+        print(
+            f"  {c_pipe} {C.BLD}{r['sym']:<12}{C.RST} {c_pipe} {r['shares']:>7,d} "
+            f"{c_pipe} {r['price']:>9,.2f} {c_pipe} {r['entry']:>9,.2f} "
+            f"{c_pipe} {C.CYN}{r['weight']:>6.1%}{C.RST} {c_pipe} {r['notional']:>11,.0f} "
+            f"{c_pipe} {pnl_color}{pnl_raw:>11}{C.RST} {c_pipe}"
+        )
+
+    print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
+    print(
+        f"  {c_pipe} {C.BLD}{'Cash':<12}{C.RST} {c_pipe} {'':>7} {c_pipe} {'':>9} {c_pipe} {'':>9} "
+        f"{c_pipe} {C.CYN}{state.cash/pv:>6.1%}{C.RST} {c_pipe} {state.cash:>11,.0f} {c_pipe} {'':>11} {c_pipe}"
+    )
+    print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
+    tot_color = C.B_GRN if total_pnl > 0 else (C.B_RED if total_pnl < 0 else C.RST)
+    print(
+        f"  {c_pipe} {C.BLD}{'TOTAL':<12}{C.RST} {c_pipe} {'':>7} {c_pipe} {'':>9} {c_pipe} {'':>9} "
+        f"{c_pipe} {C.BLD}{1.0:>6.1%}{C.RST} {c_pipe} {C.BLD}{pv:>11,.0f}{C.RST} "
+        f"{c_pipe} {tot_color}{'₹'+f'{total_pnl:+,.0f}':>11}{C.RST} {c_pipe}"
+    )
+    print(f"  {C.GRY}└──────────────┴─────────┴───────────┴───────────┴────────┴─────────────┴─────────────┘{C.RST}")
+
+    cvar        = state.realised_cvar()
+    cvar_color  = C.RED if cvar > 0.12 else C.GRN
+    print(f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}")
+    print(f"  {C.YLW}⚡{C.RST} Exposure Multiplier : {C.BLD}{state.exposure_multiplier:.3f}{C.RST}")
+    print(f"  {C.RED}🛡️ {C.RST} Override Active     : {C.BLD}{state.override_active}{C.RST}  {C.GRY}(Cooldown: {state.override_cooldown}){C.RST}")
+    print(f"  {C.CYN}📉{C.RST} CVaR (realised)     : {cvar_color}{cvar:.2%}{C.RST}")
+    print(f"  {C.RED}⚠️ {C.RST} Consec. Failures    : {C.BLD}{state.consecutive_failures}{C.RST}")
+    print(f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n")
+
+
+# ─── Main menu ────────────────────────────────────────────────────────────────
+
+def main_menu() -> None:
+    states    = {
+        "nse_total": load_portfolio_state("nse_total"),
+        "nifty":     load_portfolio_state("nifty"),
+        "custom":    load_portfolio_state("custom"),
     }
+    mkt_cache: dict = {"nse_total": {}, "nifty": {}, "custom": {}}
 
     while True:
-        print(f"\n{'═'*62}")
-        print(f"  ULTIMATE MOMENTUM V11 — DAILY WORKFLOW")
-        print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"{'═'*62}")
-        print("  [1] Screener Scan  [2] Nifty 500 Scan  [3] Backtest  [4] Status  [5] Clear  [q] Quit")
+        print(f"\n{C.BLU}  ╭────────────────────────────────────────────────────────────╮{C.RST}")
+        print(f"{C.BLU}  │{C.RST}         {C.B_CYN}ULTIMATE MOMENTUM V{__version__} — DAILY WORKFLOW{C.RST}          {C.BLU}│{C.RST}")
+        print(f"{C.BLU}  ╰────────────────────────────────────────────────────────────╯{C.RST}")
+        print(f"    {C.BLD}[1]{C.RST} NSE Total Scan      {C.BLD}[2]{C.RST} Nifty 500 Scan      {C.BLD}[3]{C.RST} Custom Screener")
+        print(f"    {C.BLD}[4]{C.RST} Backtest            {C.BLD}[5]{C.RST} Status              {C.BLD}[6]{C.RST} Manage Cash")
+        print(f"    {C.BLD}[7]{C.RST} Clear States        {C.BLD}[q]{C.RST} Quit")
 
-        c = input("\n  Choice: ").strip().lower()
+        c = input(f"\n  {C.CYN}Choice: {C.RST}").strip().lower()
 
         if c == "1":
-            states["screener"] = _run_scan(
-                fetch_screener_universe(SCREENER_URL), states["screener"], "SCREENER.IN SCAN"
-            )
+            _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
+            cfg          = UltimateConfig()
+            preview      = copy.deepcopy(states["nse_total"])
+            preview, mkt = _run_scan(fetch_nse_equity_universe(cfg=cfg), preview, "NSE TOTAL MKT SCAN", cfg)
+            mkt_cache["nse_total"] = mkt
+            _print_status(preview, "PREVIEW — NSE TOTAL", mkt)
+            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
+                states["nse_total"] = preview
+                save_portfolio_state(preview, "nse_total")
+                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
+            else:
+                print(f"  {C.GRY}[-] Discarded.{C.RST}")
+
         elif c == "2":
-            states["nifty"] = _run_scan(
-                get_nifty500(), states["nifty"], "NIFTY 500 SCAN"
-            )
+            _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")
+            cfg          = UltimateConfig()
+            preview      = copy.deepcopy(states["nifty"])
+            preview, mkt = _run_scan(get_nifty500(), preview, "NIFTY 500 SCAN", cfg)
+            mkt_cache["nifty"] = mkt
+            _print_status(preview, "PREVIEW — NIFTY 500", mkt)
+            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
+                states["nifty"] = preview
+                save_portfolio_state(preview, "nifty")
+                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
+            else:
+                print(f"  {C.GRY}[-] Discarded.{C.RST}")
+
         elif c == "3":
-            universe = get_nifty500()
-            start    = input("  Start (YYYY-MM-DD): ")
-            end      = datetime.today().strftime("%Y-%m-%d")
-            data     = load_or_fetch(universe + ["^NSEI", "^CRSLDX"], start, end)
-            print_backtest_results(run_backtest(data, universe, start, end))
+            universe = _get_custom_universe()
+            if not universe:
+                print(f"  {C.RED}[!] No custom universe found.{C.RST}")
+                print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
+                continue
+                
+            logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
+            _check_and_prompt_initial_capital(states["custom"], "CUSTOM SCREENER", "custom")
+            
+            # Structurally tighten limits for small universes to preserve math feasibility
+            custom_cfg = UltimateConfig()
+            if len(universe) < 100:
+                custom_cfg.MAX_POSITIONS = 8
+                
+            preview      = copy.deepcopy(states["custom"])
+            preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg)
+            mkt_cache["custom"] = mkt
+            _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt)
+            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
+                states["custom"] = preview
+                save_portfolio_state(preview, "custom")
+                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
+            else:
+                print(f"  {C.GRY}[-] Discarded.{C.RST}")
+
         elif c == "4":
-            summary = get_cache_summary()
-            print(summary.to_string(index=False) if not summary.empty else "  Cache is empty.")
+            print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
+            print(f"  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
+            bt_c = input(f"  {C.CYN}Choice: {C.RST}").strip()
+            
+            # HIGH-INTEGRITY UX FIX: Add a default fallback for the Start Date
+            start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}").strip() or "2020-01-01"
+            
+            if bt_c == "1":
+                universe = fetch_nse_equity_universe()
+            elif bt_c == "3":
+                universe = _get_custom_universe()
+            else:
+                universe = get_nifty500()
+
+            end        = datetime.today().strftime("%Y-%m-%d")
+            data       = load_or_fetch(universe + ["^NSEI", "^CRSLDX"], start, end)
+            sector_map = get_sector_map(universe)
+            print_backtest_results(run_backtest(data, universe, start, end, sector_map=sector_map))
+
         elif c == "5":
-            invalidate_cache()
-            invalidate_universe_cache()
-            states = {"screener": PortfolioState(), "nifty": PortfolioState()}
-            print("  ✅ Cache, Universe, and Portfolio States purged.")
+            for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:
+                has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - 1_000_000.0) >= 1.0
+                if has_activity:
+                    mkt = mkt_cache.get(name) or {}
+                    if not mkt and states[name].shares:
+                        syms = list({to_ns(s) for s in states[name].shares})
+                        end  = datetime.today().strftime("%Y-%m-%d")
+                        # High-Integrity Fix: Fetch 22 days to guarantee valid T-1 ADV signals immediately after checking status
+                        mkt  = load_or_fetch(
+                            syms,
+                            (datetime.today() - timedelta(days=22)).strftime("%Y-%m-%d"),
+                            end,
+                        )
+                        mkt_cache[name] = mkt
+                    _print_status(states[name], label, mkt)
+            if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - 1_000_000.0) >= 1.0) for n in states):
+                print(f"  {C.GRY}All portfolios are empty.{C.RST}")
+
+        elif c == "6":
+            print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
+            print(f"  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
+            p_c = input(f"  {C.CYN}Choice: {C.RST}").strip()
+            p_map = {"1": "nse_total", "2": "nifty", "3": "custom"}
+            if p_c in p_map:
+                name = p_map[p_c]
+                state = states[name]
+                print(f"\n  {C.BLD}Current Cash: {C.GRN}₹{state.cash:,.2f}{C.RST}")
+                print(f"  {C.GRY}Use positive number to deposit, negative to withdraw.{C.RST}")
+                try:
+                    amt_str = input(f"  {C.CYN}Amount (₹): {C.RST}").replace(",", "").strip()
+                    amt = float(amt_str)
+                    state.cash = max(0.0, state.cash + amt)
+                    save_portfolio_state(state, name)
+                    action = "Deposited" if amt >= 0 else "Withdrew"
+                    print(f"  {C.GRN}[+] {action} ₹{abs(amt):,.2f}. New Cash: ₹{state.cash:,.2f}{C.RST}")
+                except ValueError:
+                    print(f"  {C.RED}Invalid amount.{C.RST}")
+            else:
+                print(f"  {C.RED}Invalid choice.{C.RST}")
+
+        elif c == "7":
+            print(f"\n  {C.B_RED}WARNING: This will permanently erase ALL portfolio states and caches.{C.RST}")
+            confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
+            # HIGH-INTEGRITY FIX: Make confirmation case-insensitive
+            if confirm.upper() == "YES":
+                invalidate_cache()
+                invalidate_universe_cache()
+                for n in ["nse_total", "nifty", "custom"]:
+                    p = f"data/portfolio_state_{n}.json"
+                    for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
+                        target = p + suffix
+                        if os.path.exists(target):
+                            os.remove(target)
+                states    = {"nse_total": PortfolioState(), "nifty": PortfolioState(), "custom": PortfolioState()}
+                mkt_cache = {"nse_total": {}, "nifty": {}, "custom": {}}
+                print(f"  {C.GRN}[+] All states and caches cleared.{C.RST}")
+            else:
+                print(f"  {C.GRY}Cancelled.{C.RST}")
+
         elif c == "q":
+            print(f"  {C.GRY}Goodbye!{C.RST}\n")
             break
 
 
 if __name__ == "__main__":
-    try:
-        main_menu()
-    except KeyboardInterrupt:
-        print("\n  👋 Goodbye!")
-    except Exception as e:
-        logger.exception(f"Unhandled error: {e}")
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"{C.GRY}[%(asctime)s]{C.RST} %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    main_menu()
