@@ -129,6 +129,17 @@ class _ConstraintBuilder:
 
 @dataclass
 class UltimateConfig:
+    """Runtime configuration for portfolio construction, risk, and execution.
+
+    New fields added in v11.43:
+        CVAR_MIN_HISTORY: int = 20
+        Z_SCORE_CLIP: float = 3.0
+        CONTINUITY_BONUS: float = 0.15
+        KNIFE_WINDOW: int = 20
+        KNIFE_THRESHOLD: float = -0.15
+        REBALANCE_FREQ: str = "W-FRI"
+    """
+
     # Portfolio construction
     INITIAL_CAPITAL:          float = 1_000_000.0
     MAX_POSITIONS:            int   = 20
