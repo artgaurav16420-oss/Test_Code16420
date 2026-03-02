@@ -483,6 +483,29 @@ def test_compute_metrics_sortino():
     assert m["sortino"] > 0
 
 
+def test_run_backtest_rebalance_dates_pad_to_prior_trading_day():
+    """Weekly target dates must map to valid prior trading sessions without crashing."""
+    cfg = UltimateConfig(HISTORY_GATE=5, INITIAL_CAPITAL=1_000_000)
+    dates = pd.date_range("2020-01-02", periods=120, freq="B")
+    close = pd.DataFrame({"AAA": np.linspace(100, 140, len(dates))}, index=dates)
+    volume = pd.DataFrame({"AAA": np.ones(len(dates)) * 1e6}, index=dates)
+    market_data = {
+        "AAA.NS": pd.DataFrame({"Close": close["AAA"], "Volume": volume["AAA"]}),
+        "^NSEI": pd.DataFrame({"Close": np.linspace(10000, 11000, len(dates))}, index=dates),
+    }
+
+    results = run_backtest(
+        market_data=market_data,
+        universe=["AAA"],
+        start_date="2020-02-01",
+        end_date="2020-06-30",
+        cfg=cfg,
+    )
+
+    assert not results.equity_curve.empty
+    assert isinstance(results.equity_curve.index, pd.DatetimeIndex)
+
+
 def test_e2e_ledger_parity():
     """BacktestEngine and a manually driven PortfolioState must produce identical state."""
     n_days, n_syms = 200, 5

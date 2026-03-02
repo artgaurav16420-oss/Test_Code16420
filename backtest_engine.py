@@ -284,8 +284,14 @@ def run_backtest(
     # skip holiday Fridays, map all target rebalance dates to the nearest preceding 
     # valid trading day within the actual market data index.
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
-    valid_rebal_dates = close.index.asof(all_target_dates).dropna().unique()
-    rebal_dates = pd.DatetimeIndex(valid_rebal_dates)
+    trading_index = pd.DatetimeIndex(close.index).sort_values()
+
+    # Pandas DatetimeIndex.asof only accepts scalar labels; for vectorized alignment,
+    # use get_indexer(..., method="pad") to map each target date to the nearest prior
+    # trading day and drop unresolved targets that fall before the first bar.
+    idx = trading_index.get_indexer(all_target_dates, method="pad")
+    aligned = trading_index.take(idx[idx >= 0]) if len(idx) else pd.DatetimeIndex([])
+    rebal_dates = pd.DatetimeIndex(aligned.unique())
 
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
