@@ -155,6 +155,30 @@ def _scrape_screener(base_url: str) -> List[str]:
     return list(symbols)
 
 
+def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
+    """Remove symbols that cannot map cleanly to NSE Yahoo tickers."""
+    filtered: List[str] = []
+    invalid_count = 0
+
+    for raw in tickers:
+        sym = raw.strip().upper()
+        if not sym:
+            continue
+        # Ignore BSE-only numeric codes like 543542 that become 543542.NS and fail.
+        if sym.isdigit():
+            invalid_count += 1
+            continue
+        filtered.append(sym)
+
+    if invalid_count:
+        logger.warning(
+            "[Universe] Ignored %d non-NSE numeric ticker code(s) from custom screener.",
+            invalid_count,
+        )
+
+    return list(dict.fromkeys(filtered))
+
+
 def _get_custom_universe() -> List[str]:
     """Automatically gets universe from Screener.in URL or local fallback."""
     DEFAULT_URL = "https://www.screener.in/screens/3506127/hello/"
@@ -174,7 +198,7 @@ def _get_custom_universe() -> List[str]:
     print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
     logger.info("[Screener] Fetching universe from: %s", saved_url)
     
-    tickers = _scrape_screener(saved_url)
+    tickers = _filter_valid_custom_tickers(_scrape_screener(saved_url))
     if tickers:
         return tickers
         
@@ -188,7 +212,7 @@ def _get_custom_universe() -> List[str]:
                     content = file.read().replace(",", "\n")
                     tickers = [line.strip().upper() for line in content.split("\n") if line.strip()]
                     tickers = [t for t in tickers if t not in ("SYMBOL", "TICKER", "")]
-                    return list(set(tickers))
+                    return _filter_valid_custom_tickers(tickers)
             except Exception as e:
                 logger.error("[Screener] Failed to read %s: %s", f, e)
     return []
