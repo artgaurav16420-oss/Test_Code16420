@@ -230,7 +230,7 @@ class PortfolioState:
         # gross_exposure before the breach check so cash-heavy portfolios are
         # not penalised for the diluted portfolio-level CVaR reading.
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
-        breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT * 1.5
+        breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT
 
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
@@ -242,7 +242,9 @@ class PortfolioState:
             self.override_cooldown   = 4
         else:
             self.exposure_multiplier = new_mult
-            if not breach:
+            # Keep override active while cooldown is running so risk state is
+            # observable for downstream controls and post-run diagnostics.
+            if not breach and self.override_cooldown == 0:
                 self.override_active = False
 
         self.exposure_multiplier = float(
@@ -378,7 +380,12 @@ def execute_rebalance(
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
 
     for sym, i in active_idx.items():
-        state.last_known_prices[sym] = float(prices[i])
+        px = float(prices[i])
+        if np.isfinite(px) and px > 0:
+            state.last_known_prices[sym] = px
+        else:
+            px = float(state.last_known_prices.get(sym, 0.0))
+        prices[i] = px
         state.absent_periods.pop(sym, None)
 
     # Track absent positions and force-close after MAX_ABSENT_PERIODS.
@@ -440,6 +447,8 @@ def execute_rebalance(
         else:
             w = round(float(target_weights[i]), 10)
 
+        if not np.isfinite(w):
+            w = 0.0
         price = max(float(prices[i]), 1e-6)
         old_s = state.shares.get(sym, 0)
         s     = int(np.floor(w * pv / price)) if w > 0.001 else 0

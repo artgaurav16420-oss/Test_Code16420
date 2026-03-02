@@ -244,9 +244,13 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
     adjusted: List[str] = []
     for sym in list(state.shares.keys()):
         ns = to_ns(sym)
-        if ns not in market_data or market_data[ns].empty:
+        row = market_data.get(ns)
+        if row is None:
+            # Unit tests and offline stubs may provide bare symbols instead of .NS.
+            row = market_data.get(sym)
+        if row is None or row.empty:
             continue
-        current_price = float(market_data[ns]["Close"].iloc[-1])
+        current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
             continue
         last_price = state.last_known_prices.get(sym)
@@ -263,8 +267,10 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
                 old_entry      = state.entry_prices.get(sym, current_price * r)
                 new_entry      = old_entry / r
 
-                fractional_shares = max(0.0, theoretical_new_shares - new_shares)
-                fractional_value = fractional_shares * current_price
+                # Broker cash-in-lieu on reverse splits is based on the orphaned
+                # pre-split quantity that cannot be converted into whole shares.
+                fractional_pre_split = max(0.0, old_shares - (new_shares / r))
+                fractional_value = fractional_pre_split * current_price
                 state.cash = round(state.cash + fractional_value, 10)
 
                 logger.warning(
