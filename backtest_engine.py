@@ -24,9 +24,9 @@ from momentum_engine import (
     Trade,
     to_ns,
 )
-from signals import generate_signals, compute_regime_score
+from signals import generate_signals, compute_regime_score, compute_single_adv
 
-logger    = logging.getLogger(__name__)
+logger     = logging.getLogger(__name__)
 REBAL_FREQ = "W-FRI"
 
 
@@ -64,10 +64,13 @@ class BacktestEngine:
         sector_map:      Optional[dict]         = None,
     ) -> pd.DataFrame:
         start_dt = pd.Timestamp(start_date)
-        
-        # HIGH-INTEGRITY FIX: Prevent backtest date leakage over end_date limits
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
         symbols  = list(close.columns)
+
+        # FIX: Convert rebalance_dates to a set for O(1) membership tests.
+        # pd.DatetimeIndex.__contains__ is O(n); over a 5-year daily backtest
+        # this adds ~338k redundant comparisons per run.
+        rebal_set = set(rebalance_dates)
 
         for date in close.index:
             if date < start_dt or date > end_dt:
@@ -76,7 +79,6 @@ class BacktestEngine:
             close_t  = close.loc[date]
             prices_t = close_t.values.astype(float)
 
-            # Current PV for logging (execute_rebalance will recompute internally).
             active_idx = {sym: i for i, sym in enumerate(symbols)}
             pv = self.state.cash + sum(
                 self.state.shares.get(sym, 0) * (
@@ -87,7 +89,7 @@ class BacktestEngine:
                 for sym in self.state.shares
             )
 
-            if date in rebalance_dates:
+            if date in rebal_set:
                 self._run_rebalance(
                     date, close, volume, returns, symbols, prices_t,
                     pv, idx_df, sector_map,
@@ -128,33 +130,36 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, volume, date)
 
+        # Use T-1 prices from state cache — NOT today's execution price —
+        # to compute current weights, preventing subtle look-ahead bias.
         prev_w_dict = {
             sym: (self.state.shares.get(sym, 0) * px) / pv
             for sym in symbols
             if self.state.shares.get(sym, 0) > 0 and pv > 0
-            for px in [
-                float(close.loc[date, sym])
-                if pd.notna(close.loc[date, sym])
-                else self.state.last_known_prices.get(sym)
-            ]
-            if px is not None and np.isfinite(px)
+            for px in [self.state.last_known_prices.get(sym, 0.0)]
+            if px is not None and np.isfinite(px) and px > 0
         }
 
         raw_daily, adj_scores, sel_idx = generate_signals(
             hist_log_rets,
             adv_vector,
-            cfg.HISTORY_GATE,
-            cfg.MAX_POSITIONS,
+            cfg,
             prev_weights=prev_w_dict,
-            halflife_fast=cfg.HALFLIFE_FAST,
-            halflife_slow=cfg.HALFLIFE_SLOW,
         )
 
-        _idx_ok     = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
-        idx_slice   = idx_df.loc[:date].iloc[:-1] if _idx_ok else None
+        _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
+        idx_slice    = idx_df.loc[:date].iloc[:-1] if _idx_ok else None
         regime_score = compute_regime_score(idx_slice)
 
-        realised_cvar = self.state.realised_cvar()
+        # Guard: only use realised CVaR once enough history has accumulated.
+        # Below cfg.CVAR_MIN_HISTORY observations the value is statistically
+        # meaningless and would suppress the exposure multiplier at backtest
+        # start due to a CVaR computed from 1–3 data points.
+        if len(self.state.equity_hist) >= cfg.CVAR_MIN_HISTORY:
+            realised_cvar = self.state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
+        else:
+            realised_cvar = 0.0
+
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
                 float(close.loc[date, sym])
@@ -188,7 +193,7 @@ class BacktestEngine:
                 )
                 target_weights[sel_idx]  = weights_sel
                 self.state.consecutive_failures = 0
-                self.state.decay_rounds  = 0   # solver healthy — reset decay counter
+                self.state.decay_rounds  = 0
                 optimization_succeeded   = True
 
             except OptimizationError as oe:
@@ -227,28 +232,17 @@ def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timesta
     """
     Build the ADV (average daily volume) vector for sizing constraints.
 
-    Uses volume.loc[:date].iloc[:-1] — the T-1 slice — so that a Friday
-    rebalance cannot see Friday's aggregate volume, which is only known after
-    market close.  The 20-day rolling mean and the most recent single day are
-    both taken from this slice; we use the minimum as the conservative choice.
-    
-    Includes a targeted `.replace(0, np.nan)` call to seamlessly scrub over 
-    false 0-volume data glitches frequently emitted by yfinance APIs.
+    Applies the T-1 slice (iloc[:-1]) before delegating to compute_single_adv,
+    ensuring the current rebalance date's volume is excluded (look-ahead fix).
+    The outer try/except guards against pandas indexing errors on sparse data.
     """
     adv = []
     for sym in symbols:
         if sym in volume.columns:
             try:
-                # iloc[:-1]: exclude the current rebalance date (lookahead fix)
+                # iloc[:-1]: exclude the current rebalance date (look-ahead fix).
                 series = volume.loc[:date, sym].iloc[:-1]
-                
-                # HIGH-INTEGRITY PATCH: Handle yfinance 0-volume data glitches
-                clean_series = series.replace(0, np.nan).ffill().fillna(0)
-                ma20   = float(clean_series.rolling(20, min_periods=1).mean().iloc[-1])
-                last   = float(clean_series.iloc[-1])
-                val    = min(ma20, last)
-                
-                adv.append(val if np.isfinite(val) else 0.0)
+                adv.append(compute_single_adv(series))
             except Exception:
                 adv.append(0.0)
         else:
@@ -277,7 +271,6 @@ def run_backtest(
     if cfg is None:
         cfg = UltimateConfig()
 
-    # Build close & volume DataFrames from market_data.
     close_d  = {}
     volume_d = {}
     for sym in universe:
@@ -310,6 +303,13 @@ def run_backtest(
 
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
+
+    if eq_weekly.empty and not eq_daily.empty:
+        logger.warning(
+            "[Backtest] No rebalance dates align with equity curve index. "
+            "Defaulting to daily series for metrics."
+        )
+        eq_weekly = eq_daily
 
     rebal_log = (
         pd.DataFrame(bt._rebal_rows).set_index("date")
@@ -352,8 +352,6 @@ def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
 
     dr = eq.pct_change(fill_method=None).dropna()
     if len(dr) > 1 and dr.std() > 0:
-        # Annualise using the actual average holding period between observations,
-        # not a hardcoded 52 (rebalance dates are not uniformly spaced).
         avg_days_between = span / len(dr)
         periods_per_year = 365.25 / avg_days_between
         sharpe = (dr.mean() * periods_per_year) / (dr.std() * np.sqrt(periods_per_year))

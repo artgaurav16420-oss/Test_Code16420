@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -46,17 +47,20 @@ __version__ = "11.42"
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
 class C:
-    BLU   = "\033[34m"
-    CYN   = "\033[36m"
-    GRN   = "\033[32m"
-    YLW   = "\033[33m"
-    RED   = "\033[31m"
-    GRY   = "\033[90m"
-    RST   = "\033[0m"
-    BLD   = "\033[1m"
-    B_CYN = "\033[1;36m"
-    B_GRN = "\033[1;32m"
-    B_RED = "\033[1;31m"
+    if sys.stdout.isatty():
+        BLU   = "\033[34m"
+        CYN   = "\033[36m"
+        GRN   = "\033[32m"
+        YLW   = "\033[33m"
+        RED   = "\033[31m"
+        GRY   = "\033[90m"
+        RST   = "\033[0m"
+        BLD   = "\033[1m"
+        B_CYN = "\033[1;36m"
+        B_GRN = "\033[1;32m"
+        B_RED = "\033[1;31m"
+    else:
+        BLU = CYN = GRN = YLW = RED = GRY = RST = BLD = B_CYN = B_GRN = B_RED = ""
 
 
 logger = logging.getLogger(__name__)
@@ -98,7 +102,6 @@ def _scrape_screener(base_url: str) -> List[str]:
     symbols = set()
     page = 1
     
-    # HIGH-INTEGRITY FIX: Use proper URL parsing to remove only 'page' and preserve other screener filters
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
     qs.pop('page', None)
@@ -132,7 +135,6 @@ def _scrape_screener(base_url: str) -> List[str]:
                 symbols.add(sym)
                 page_symbols += 1
                 
-        # Break loop if we hit a page with no new symbols
         if page_symbols == 0:
             break
             
@@ -153,7 +155,6 @@ def _get_custom_universe() -> List[str]:
             if content:
                 saved_url = content
     else:
-        # Save the default URL so it can be manually edited later if needed
         os.makedirs("data", exist_ok=True)
         with open(url_file, "w") as f:
             f.write(DEFAULT_URL)
@@ -167,7 +168,6 @@ def _get_custom_universe() -> List[str]:
         
     logger.warning("[Screener] Scraping failed or returned 0 tickers. Attempting local file fallback...")
 
-    # Fallback to local files
     files = ["custom_screener.csv", "custom_screener.txt"]
     for f in files:
         if os.path.exists(f):
@@ -223,13 +223,10 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
             if abs(ratio - r) / r <= _SPLIT_TOLERANCE:
                 old_shares     = state.shares[sym]
                 theoretical_new_shares = old_shares * r
-                # Exchanges do not round split allotments upward.
-                # Any fractional entitlement is cash-settled by the broker/registrar.
                 new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
                 old_entry      = state.entry_prices.get(sym, current_price * r)
                 new_entry      = old_entry / r
 
-                # HIGH-INTEGRITY FIX: Fractional post-split shares are settled in cash.
                 fractional_shares = max(0.0, theoretical_new_shares - new_shares)
                 fractional_value = fractional_shares * current_price
                 state.cash = round(state.cash + fractional_value, 10)
@@ -349,6 +346,8 @@ def _run_scan(
         if sym in active_idx
     )
     pv = mtm_notional + state.cash
+    initial_cash = state.cash
+    initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
 
     close_hist    = close.iloc[:-1]   
     log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
@@ -356,8 +355,7 @@ def _run_scan(
     prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
     _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
 
-    gross_exposure = mtm_notional / pv if pv > 0 else 1.0
-    state.update_exposure(regime_score, state.realised_cvar(), cfg, gross_exposure=gross_exposure)
+    state.update_exposure(regime_score, state.realised_cvar(), cfg, gross_exposure=initial_gross_exposure)
 
     weights              = np.zeros(len(active))
     apply_decay          = False
@@ -367,10 +365,7 @@ def _run_scan(
 
     try:
         raw_daily, adj_scores, sel_idx = generate_signals(
-            log_rets, adv_arr, cfg.HISTORY_GATE, cfg.MAX_POSITIONS,
-            prev_weights=state.weights,   
-            halflife_fast=cfg.HALFLIFE_FAST,
-            halflife_slow=cfg.HALFLIFE_SLOW,
+            log_rets, adv_arr, cfg, prev_weights=state.weights
         )
         if not sel_idx:
             raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
@@ -435,9 +430,25 @@ def _run_scan(
     elapsed = time.perf_counter() - scan_started_at
     _print_stage_status("Analysis", 1.0, f"{label} completed in {elapsed:.1f}s.")
     
-    # ── Print Action Sheet sorted by weight for manual execution ──
     if trade_log:
-        print(f"\n  {C.B_CYN}EXECUTION ACTION SHEET (Manual Targets){C.RST}")
+        final_mtm = sum(state.shares.get(sym, 0) * prices[active_idx[sym]] for sym in state.shares if sym in active_idx)
+        final_gross_exposure = final_mtm / final_pv if final_pv > 0 else 0.0
+        net_cash_delta = state.cash - initial_cash
+        
+        print(f"\n  {C.B_CYN}=== PHASE A: TRADE INTENT SUMMARY ==={C.RST}")
+        print(f"  {C.GRY}{'─' * 66}{C.RST}")
+        print(f"  {C.BLD}Gross Exp Before:{C.RST} {initial_gross_exposure:>7.1%}")
+        print(f"  {C.BLD}Gross Exp After: {C.RST} {final_gross_exposure:>7.1%}")
+        cash_color = C.B_GRN if net_cash_delta >= 0 else C.B_RED
+        print(f"  {C.BLD}Net Cash Delta:  {C.RST} {cash_color}₹{net_cash_delta:+,.0f}{C.RST}")
+        print(f"  {C.BLD}Total Slippage:  {C.RST} {C.RED}₹{total_slippage:,.0f}{C.RST}")
+
+        largest_trade = max(trade_log, key=lambda t: abs(t.delta_shares) * t.exec_price, default=None)
+        if largest_trade:
+            notional = abs(largest_trade.delta_shares) * largest_trade.exec_price
+            print(f"  {C.BLD}Largest Change:  {C.RST} {largest_trade.direction} {largest_trade.symbol} (₹{notional:,.0f})")
+
+        print(f"\n  {C.B_CYN}=== PHASE B: EXECUTION ACTION SHEET ==={C.RST}")
         print(f"  {C.GRY}{'─' * 66}{C.RST}")
         
         sorted_trades = sorted(trade_log, key=lambda t: state.weights.get(t.symbol, 0.0), reverse=True)
@@ -657,7 +668,6 @@ def main_menu() -> None:
             logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
             _check_and_prompt_initial_capital(states["custom"], "CUSTOM SCREENER", "custom")
             
-            # Structurally tighten limits for small universes to preserve math feasibility
             custom_cfg = UltimateConfig()
             if len(universe) < 100:
                 custom_cfg.MAX_POSITIONS = 8
@@ -680,7 +690,6 @@ def main_menu() -> None:
             if not bt_c:
                 continue
             
-            # HIGH-INTEGRITY UX FIX: Add a default fallback for the Start Date
             raw_start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}")
             try:
                 start = _normalise_start_date(raw_start)
@@ -708,7 +717,6 @@ def main_menu() -> None:
                     if not mkt and states[name].shares:
                         syms = list({to_ns(s) for s in states[name].shares})
                         end  = datetime.today().strftime("%Y-%m-%d")
-                        # High-Integrity Fix: Fetch 22 days to guarantee valid T-1 ADV signals immediately after checking status
                         mkt  = load_or_fetch(
                             syms,
                             (datetime.today() - timedelta(days=22)).strftime("%Y-%m-%d"),
@@ -746,7 +754,6 @@ def main_menu() -> None:
         elif c == "7":
             print(f"\n  {C.B_RED}WARNING: This will permanently erase ALL portfolio states and caches.{C.RST}")
             confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
-            # HIGH-INTEGRITY FIX: Make confirmation case-insensitive
             if confirm.upper() == "YES":
                 invalidate_cache()
                 invalidate_universe_cache()
@@ -768,9 +775,18 @@ def main_menu() -> None:
 
 
 if __name__ == "__main__":
+    # ── Professional logging: console + file ───────────────────────────────
+    os.makedirs("logs", exist_ok=True)          # create logs/ folder if missing
+
     logging.basicConfig(
         level=logging.INFO,
         format=f"{C.GRY}[%(asctime)s]{C.RST} %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),                                 # console (existing behaviour)
+            logging.FileHandler("logs/ultimate.log", encoding="utf-8", mode="a")
+        ]
     )
+
+    logger.info("Ultimate Momentum v%s started", __version__)
     main_menu()

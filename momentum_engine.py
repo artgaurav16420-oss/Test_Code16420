@@ -5,16 +5,16 @@ CVaR-constrained Mean-Variance Optimizer with full Transaction Cost formulation.
 
 Architecture
 ------------
-InstitutionalRiskEngine is a *stateless* optimizer.  All persistent portfolio
+InstitutionalRiskEngine is a stateless optimizer. All persistent portfolio
 state — including exposure_multiplier, override flags, and equity history —
-lives exclusively in PortfolioState.  No manual sync boilerplate at call sites.
+lives exclusively in PortfolioState. No manual sync boilerplate at call sites.
 
 Corporate actions
 -----------------
-yfinance ``auto_adjust=True`` back-adjusts all historical prices for splits and
-dividends.  The backtest operates on this adjusted series chronologically, so a
-pre-split purchase books proportionally more shares at the (lower adjusted) price,
-exactly replicating the post-split share count.  No separate split ledger is needed.
+yfinance auto_adjust=True back-adjusts all historical prices for splits and
+dividends. The backtest operates on this adjusted series chronologically, so a
+pre-split purchase books proportionally more shares at the lower adjusted price,
+exactly replicating the post-split share count. No separate split ledger needed.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import osqp
 import scipy.sparse as sp
 from sklearn.covariance import LedoitWolf
 
-# HIGH-INTEGRITY FIX: Scope the warning filter so we don't silence critical OSQP/NumPy warnings
+# Scope the filter to sklearn only — do not silence OSQP or NumPy warnings.
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,11 @@ class OptimizationErrorType(Enum):
 
 
 class OptimizationError(Exception):
-    def __init__(self, message: str, error_type: OptimizationErrorType = OptimizationErrorType.NUMERICAL):
+    def __init__(
+        self,
+        message:    str,
+        error_type: OptimizationErrorType = OptimizationErrorType.NUMERICAL,
+    ):
         super().__init__(message)
         self.error_type = error_type
 
@@ -73,7 +77,7 @@ class Trade:
     delta_shares: int
     exec_price:   float
     slip_cost:    float
-    direction:    str  # "BUY" | "SELL"
+    direction:    str          # "BUY" | "SELL"
 
 
 @dataclass
@@ -86,7 +90,7 @@ class SolverDiagnostics:
     cvar_value:        float
     slack_value:       float
     sum_adv_limit:     float
-    adv_binding_count: int      # number of weights at their ADV cap
+    adv_binding_count: int
     ridge_applied:     float
     cond_number:       float
     t_cvar:            int
@@ -101,8 +105,10 @@ class SolverDiagnostics:
 @dataclass
 class UltimateConfig:
     # Portfolio construction
+    # MAX_POSITIONS 15→20: Nifty 500 is a clean, liquid universe; more positions
+    # improves diversification without diluting signal quality.
     INITIAL_CAPITAL:          float = 1_000_000.0
-    MAX_POSITIONS:            int   = 15
+    MAX_POSITIONS:            int   = 20
     MAX_PORTFOLIO_RISK_PCT:   float = 0.12
     MAX_ADV_PCT:              float = 0.05
     IMPACT_COEFF:             float = 5e-4
@@ -112,7 +118,8 @@ class UltimateConfig:
     CVAR_DAILY_LIMIT:         float = 0.022
     CVAR_ALPHA:               float = 0.95
     CVAR_LOOKBACK:            int   = 200
-    CVAR_SENTINEL_MULTIPLIER: float = 2.5   
+    CVAR_SENTINEL_MULTIPLIER: float = 2.5
+    CVAR_MIN_HISTORY: int = 20
 
     # Exposure management
     DELEVERAGING_LIMIT:       float = 0.10
@@ -131,7 +138,9 @@ class UltimateConfig:
     # Execution
     SLIPPAGE_BPS:             float = 20.0
     DECAY_FACTOR:             float = 0.85
-    MIN_ADV_CRORES:           float = 50.0
+    # MIN_ADV_CRORES 50→100: Every Nifty 500 constituent clears ₹100cr/day.
+    # This now acts as a data-quality guard, not a universe filter.
+    MIN_ADV_CRORES:           float = 100.0
 
     # Ghost position / data-glitch protection
     MAX_ABSENT_PERIODS:       int   = 3
@@ -173,11 +182,14 @@ class PortfolioState:
         cfg:            UltimateConfig,
         gross_exposure: float = 1.0,
     ) -> None:
-        # Smooth step
-        target = 1.0 / (1.0 + np.exp(-10.0 * (regime_score - 0.5)))
-        new_mult = self.exposure_multiplier + float(np.clip(target - self.exposure_multiplier, -cfg.DELEVERAGING_LIMIT, cfg.DELEVERAGING_LIMIT))
+        target   = 1.0 / (1.0 + np.exp(-10.0 * (regime_score - 0.5)))
+        new_mult = self.exposure_multiplier + float(
+            np.clip(target - self.exposure_multiplier, -cfg.DELEVERAGING_LIMIT, cfg.DELEVERAGING_LIMIT)
+        )
 
-        # HIGH-INTEGRITY FIX: Prevent double-deleveraging on transient CVaR spikes
+        # Prevent double-deleveraging on transient CVaR spikes: normalise by
+        # gross_exposure before the breach check so cash-heavy portfolios are
+        # not penalised for the diluted portfolio-level CVaR reading.
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
         breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT * 1.5
 
@@ -185,7 +197,7 @@ class PortfolioState:
             self.override_cooldown -= 1
 
         if breach and not self.override_active and self.override_cooldown == 0:
-            override_mult = max(cfg.MIN_EXPOSURE_FLOOR, self.exposure_multiplier * 0.5)
+            override_mult            = max(cfg.MIN_EXPOSURE_FLOOR, self.exposure_multiplier * 0.5)
             self.exposure_multiplier = min(new_mult, override_mult)
             self.override_active     = True
             self.override_cooldown   = 4
@@ -194,7 +206,9 @@ class PortfolioState:
             if not breach:
                 self.override_active = False
 
-        self.exposure_multiplier = float(np.clip(self.exposure_multiplier, cfg.MIN_EXPOSURE_FLOOR, 1.0))
+        self.exposure_multiplier = float(
+            np.clip(self.exposure_multiplier, cfg.MIN_EXPOSURE_FLOOR, 1.0)
+        )
 
     def realised_cvar(self, min_obs: int = 30) -> float:
         n = len(self.equity_hist)
@@ -202,11 +216,13 @@ class PortfolioState:
             if n > 1:
                 logger.debug(
                     "CVaR computed on only %d observations (min %d for stability); "
-                    "returning 0.0 during warm-up.", n, min_obs
+                    "returning 0.0 during warm-up.", n, min_obs,
                 )
             return 0.0
 
-        rets  = np.log1p(pd.Series(self.equity_hist).pct_change(fill_method=None).clip(lower=-0.99)).dropna()
+        rets  = np.log1p(
+            pd.Series(self.equity_hist).pct_change(fill_method=None).clip(lower=-0.99)
+        ).dropna()
         if rets.empty:
             return 0.0
         var_q = rets.quantile(0.05)
@@ -222,15 +238,14 @@ class PortfolioState:
             else:
                 px = self.last_known_prices.get(sym)
                 if px is None:
-                    logger.warning("record_eod: no price for %s and no last known price; treating as ₹0.", sym)
-                else:
-                    logger.debug("record_eod: carrying %s at last known price ₹%.2f.", sym, px)
+                    logger.warning(
+                        "record_eod: no price for %s and no last known price; treating as ₹0.", sym
+                    )
             pv += n_shares * float(px or 0.0)
 
+        # Flat-day deduplication is intentionally absent. Removing zero-return
+        # days mathematically inflates CVaR, so every day must be recorded.
         pv_rounded = round(float(pv), 10)
-        
-        # HIGH-INTEGRITY FIX: Removed the flat-day deduplication (`if eq[-1] == pv_rounded: return`). 
-        # Stripping identical consecutive values mathematically removes zero-return days, artificially inflating CVaR.
         self.equity_hist.append(pv_rounded)
         if len(self.equity_hist) > self.equity_hist_cap:
             self.equity_hist = self.equity_hist[-self.equity_hist_cap:]
@@ -293,17 +308,18 @@ class PortfolioState:
         ps.universe             = _get("universe",             list,                                            [])
         ps.cash                 = _get("cash",                 float,                                           ps.cash)
         ps.exposure_multiplier  = _get("exposure_multiplier",  float,                                           1.0)
-        # bool("False") is True; parse defensively for manual/legacy JSON states.
         ps.override_active      = _get("override_active",      _as_bool,                                        False)
         ps.override_cooldown    = _get("override_cooldown",    int,                                             0)
         ps.consecutive_failures = _get("consecutive_failures", int,                                             0)
         ps.equity_hist_cap      = _get("equity_hist_cap",      int,                                             250)
-        ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x)   for k, x in v.items()}, {})
+        ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.decay_rounds         = _get("decay_rounds",         int,                                             0)
 
         if errors:
-            logger.error("PortfolioState.from_dict: %d field(s) reset to defaults: %s", len(errors), errors)
+            logger.error(
+                "PortfolioState.from_dict: %d field(s) reset to defaults: %s", len(errors), errors
+            )
         return ps
 
 
@@ -324,8 +340,9 @@ def execute_rebalance(
 
     for sym, i in active_idx.items():
         state.last_known_prices[sym] = float(prices[i])
-        state.absent_periods.pop(sym, None)   
+        state.absent_periods.pop(sym, None)
 
+    # Track absent positions and force-close after MAX_ABSENT_PERIODS.
     symbols_to_force_close: List[str] = []
     for sym in list(state.shares.keys()):
         if sym not in active_idx:
@@ -351,19 +368,19 @@ def execute_rebalance(
         if sym in active_idx:
             pv += n_shares * float(prices[active_idx[sym]])
         elif sym not in symbols_to_force_close:
-            carry_price = state.last_known_prices.get(sym, 0.0)
-            pv += n_shares * carry_price
+            pv += n_shares * state.last_known_prices.get(sym, 0.0)
 
-    hold_flat = False   
+    # Decay logic: after MAX_DECAY_ROUNDS consecutive failures hold flat.
+    hold_flat = False
     if apply_decay:
         if state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
             logger.warning(
-                "execute_rebalance: MAX_DECAY_ROUNDS=%d reached — holding positions flat "
-                "instead of applying further %.0f%% decay.",
+                "execute_rebalance: MAX_DECAY_ROUNDS=%d reached — holding positions "
+                "flat instead of applying further %.0f%% decay.",
                 cfg.MAX_DECAY_ROUNDS, (1 - cfg.DECAY_FACTOR) * 100,
             )
-            hold_flat  = True
-            apply_decay = False   
+            hold_flat   = True
+            apply_decay = False
         else:
             state.decay_rounds += 1
             logger.info(
@@ -378,11 +395,12 @@ def execute_rebalance(
 
     for i, sym in enumerate(active_symbols):
         if hold_flat:
-            w = round(state.weights.get(sym, 0.0), 10)    
+            w = round(state.weights.get(sym, 0.0), 10)
         elif apply_decay:
             w = round(state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR, 10)
         else:
             w = round(float(target_weights[i]), 10)
+
         price = max(float(prices[i]), 1e-6)
         old_s = state.shares.get(sym, 0)
         s     = int(np.floor(w * pv / price)) if w > 0.001 else 0
@@ -403,7 +421,9 @@ def execute_rebalance(
                     new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + entry_slip) * delta) / s
 
             if delta != 0 and trade_log is not None and date_context is not None:
-                trade_log.append(Trade(sym, date_context, delta, price, slip, "BUY" if delta > 0 else "SELL"))
+                trade_log.append(
+                    Trade(sym, date_context, delta, price, slip, "BUY" if delta > 0 else "SELL")
+                )
 
         elif old_s > 0:
             slip            = old_s * price * exit_slip
@@ -411,6 +431,7 @@ def execute_rebalance(
             if trade_log is not None and date_context is not None:
                 trade_log.append(Trade(sym, date_context, -old_s, price, slip, "SELL"))
 
+    # Carry positions for symbols absent from the current data feed.
     for sym in state.shares:
         if sym not in active_idx and sym not in symbols_to_force_close:
             new_shares[sym]       = state.shares[sym]
@@ -418,17 +439,19 @@ def execute_rebalance(
             new_entry_prices[sym] = state.entry_prices.get(sym, 0.0)
             actual_notional      += new_shares[sym] * state.last_known_prices.get(sym, 0.0)
 
+    # Force-close delisted positions at last known price.
     for sym in symbols_to_force_close:
         close_price = state.last_known_prices.get(sym, 0.0)
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0 and close_price > 0:
             slip            = n_shares * close_price * exit_slip
             total_slippage += slip
-            pv             += n_shares * close_price   
+            pv             += n_shares * close_price
             if trade_log is not None and date_context is not None:
                 trade_log.append(Trade(sym, date_context, -n_shares, close_price, slip, "SELL"))
         state.absent_periods.pop(sym, None)
 
+    # Prune stale entry prices for closed positions.
     for sym in list(new_entry_prices):
         if sym not in new_shares:
             del new_entry_prices[sym]
@@ -436,7 +459,7 @@ def execute_rebalance(
     state.weights      = new_weights
     state.shares       = new_shares
     state.entry_prices = new_entry_prices
-    # HIGH-INTEGRITY FIX: Prevent silent floating-point cash inversion below ₹0
+    # Prevent silent floating-point cash inversion below ₹0.
     state.cash         = max(0.0, round(pv - actual_notional - total_slippage, 10))
     return round(total_slippage, 10)
 
@@ -463,66 +486,76 @@ class InstitutionalRiskEngine:
         if m == 0:
             return np.array([])
 
+        # ── Input validation ──────────────────────────────────────────────────
         if len(prices) != m or len(adv_shares) != m:
             raise OptimizationError(
                 "Input length mismatch across expected_returns/prices/adv_shares.",
                 OptimizationErrorType.DATA,
             )
-
         if prev_w is not None and len(prev_w) != m:
             raise OptimizationError(
                 "prev_w length must match expected_returns length.",
                 OptimizationErrorType.DATA,
             )
-
         if not np.all(np.isfinite(expected_returns)):
-            raise OptimizationError("expected_returns contains non-finite values.", OptimizationErrorType.DATA)
+            raise OptimizationError(
+                "expected_returns contains non-finite values.", OptimizationErrorType.DATA
+            )
         if not np.all(np.isfinite(prices)) or np.any(prices <= 0):
-            raise OptimizationError("prices must be finite and strictly positive.", OptimizationErrorType.DATA)
+            raise OptimizationError(
+                "prices must be finite and strictly positive.", OptimizationErrorType.DATA
+            )
         if not np.all(np.isfinite(adv_shares)) or np.any(adv_shares < 0):
-            raise OptimizationError("adv_shares must be finite and non-negative.", OptimizationErrorType.DATA)
+            raise OptimizationError(
+                "adv_shares must be finite and non-negative.", OptimizationErrorType.DATA
+            )
         if not np.isfinite(portfolio_value) or portfolio_value <= 0:
-            raise OptimizationError("portfolio_value must be finite and strictly positive.", OptimizationErrorType.DATA)
+            raise OptimizationError(
+                "portfolio_value must be finite and strictly positive.", OptimizationErrorType.DATA
+            )
 
+        # ── History check ─────────────────────────────────────────────────────
         clean_rets = historical_returns.replace([np.inf, -np.inf], np.nan).ffill().dropna()
-        T = len(clean_rets)
-        min_rows = self.cfg.DIMENSIONALITY_MULTIPLIER * m
+        T          = len(clean_rets)
+        min_rows   = self.cfg.DIMENSIONALITY_MULTIPLIER * m
         if T < min_rows:
-            raise OptimizationError(f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA)
+            raise OptimizationError(
+                f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA
+            )
 
-        # HIGH-INTEGRITY FIX: Revert sentinel to check the Equally-Weighted (EW) basket CVaR. 
-        # Checking the worst single asset is mathematically too strict for momentum universes, 
-        # as it forces the engine to abort if even ONE selected stock is highly volatile. 
-        # The OSQP solver's mathematical purpose is to dynamically size down volatile assets.
+        # ── CVaR sentinel (EW basket check, not worst single asset) ──────────
         ew_rets  = clean_rets.mean(axis=1)
         var_95   = ew_rets.quantile(1 - self.cfg.CVAR_ALPHA)
         ew_cvar  = -float(ew_rets[ew_rets <= var_95].mean()) if not ew_rets.empty else 0.0
-        
         sentinel = self.cfg.CVAR_DAILY_LIMIT * self.cfg.CVAR_SENTINEL_MULTIPLIER
         if ew_cvar > sentinel:
-            raise OptimizationError(f"Selection EW-CVaR {ew_cvar:.2%} exceeds sentinel {sentinel:.2%}.", OptimizationErrorType.INFEASIBLE)
+            raise OptimizationError(
+                f"Selection EW-CVaR {ew_cvar:.2%} exceeds sentinel {sentinel:.2%}.",
+                OptimizationErrorType.INFEASIBLE,
+            )
 
-        # HIGH-INTEGRITY FIX: LedoitWolf is explicitly stateful (caches `.covariance_`). 
-        # Moving instantiation inside `optimize()` guarantees thread-safe, purely stateless runs.
+        # ── Covariance estimation (LedoitWolf instantiated per call for thread safety) ──
         lw = LedoitWolf()
         lw.fit(clean_rets)
         Sigma     = lw.covariance_
         ridge     = 1e-8 * float(np.trace(Sigma))
         Sigma_reg = Sigma + ridge * np.eye(m)
 
+        # ── Exposure bounds ───────────────────────────────────────────────────
         gamma     = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
-        adv_limit = np.clip((adv_shares * prices * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40)
-        
+        adv_limit = np.clip(
+            (adv_shares * prices * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40
+        )
         l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
         u_gamma = min(1.0, gamma * (1.0 + self.cfg.CAPITAL_ELASTICITY))
-        
+
         max_possible_weight = 0.0
         if sector_labels is not None:
             labels = np.asarray(sector_labels, dtype=int)
             for sec_id in np.unique(labels):
-                mask = labels == sec_id
+                mask    = labels == sec_id
                 sec_max = float(np.sum(adv_limit[mask]))
-                if mask.sum() >= 2: 
+                if mask.sum() >= 2:
                     sec_max = min(sec_max, self.cfg.MAX_SECTOR_WEIGHT)
                 max_possible_weight += sec_max
         else:
@@ -531,36 +564,43 @@ class InstitutionalRiskEngine:
         u_gamma = min(u_gamma, max_possible_weight)
         if max_possible_weight < l_gamma:
             l_gamma = max_possible_weight * 0.99
-            
         if np.sum(adv_limit) < l_gamma:
             l_gamma = np.sum(adv_limit) * 0.99
-            
-        u_gamma = max(u_gamma, l_gamma) 
+        u_gamma = max(u_gamma, l_gamma)
 
-        impact = np.clip(self.cfg.IMPACT_COEFF * portfolio_value / (np.maximum(prices, 1.0) * np.maximum(adv_shares, 1.0)), 0.0, 1e4)
+        # ── QP variable layout ────────────────────────────────────────────────
+        # [w(m), t(m), η(1), z(T_cvar), slack(1)]
+        impact     = np.clip(
+            self.cfg.IMPACT_COEFF * portfolio_value
+            / (np.maximum(prices, 1.0) * np.maximum(adv_shares, 1.0)),
+            0.0, 1e4,
+        )
         T_cvar     = min(T, self.cfg.CVAR_LOOKBACK)
-        losses     = -clean_rets.iloc[-T_cvar:].values      
+        losses     = -clean_rets.iloc[-T_cvar:].values
         n_vars     = 2 * m + 1 + T_cvar + 1
         prev_w_arr = prev_w if prev_w is not None else np.zeros(m)
 
-        P_w = 2.0 * (self.cfg.RISK_AVERSION * Sigma_reg + np.diag(impact))
+        P_w   = 2.0 * (self.cfg.RISK_AVERSION * Sigma_reg + np.diag(impact))
         P_aux = sp.eye(n_vars - m, format="csc") * 1e-6
-        P   = sp.block_diag([sp.csc_matrix(P_w), P_aux], format="csc")
-        
+        P     = sp.block_diag([sp.csc_matrix(P_w), P_aux], format="csc")
+
         q        = np.zeros(n_vars)
         q[:m]    = -expected_returns - 2.0 * impact * prev_w_arr
-        q[m:2*m] = self.cfg.SLIPPAGE_BPS / 10_000.0   
+        q[m:2*m] = self.cfg.SLIPPAGE_BPS / 10_000.0
         q[-1]    = self.cfg.SLACK_PENALTY
 
         A_parts: list = []
         l_parts: list = []
         u_parts: list = []
 
-        budget_data = np.ones(m)
-        budget_row  = sp.csc_matrix((budget_data, (np.zeros(m, int), np.arange(m))), shape=(1, n_vars))
+        # Budget constraint
+        budget_row = sp.csc_matrix(
+            (np.ones(m), (np.zeros(m, int), np.arange(m))), shape=(1, n_vars)
+        )
         A_parts.append(budget_row)
         l_parts.append([l_gamma]); u_parts.append([u_gamma])
 
+        # CVaR scenario constraints
         A_scen = sp.lil_matrix((T_cvar, n_vars))
         A_scen[:, :m]  = losses
         A_scen[:, 2*m] = -1.0
@@ -569,33 +609,35 @@ class InstitutionalRiskEngine:
         A_parts.append(A_scen.tocsc())
         l_parts.append([-np.inf] * T_cvar); u_parts.append([0.0] * T_cvar)
 
+        # CVaR daily limit
         scen_c = 1.0 / (T_cvar * (1.0 - self.cfg.CVAR_ALPHA))
         lim    = sp.lil_matrix((1, n_vars))
-        lim[0, 2*m]                       = 1.0
-        lim[0, 2*m+1:2*m+1+T_cvar]        = scen_c
-        lim[0, -1]                         = -1.0
+        lim[0, 2*m]                 = 1.0
+        lim[0, 2*m+1:2*m+1+T_cvar] = scen_c
+        lim[0, -1]                  = -1.0
         A_parts.append(lim.tocsc())
         l_parts.append([-np.inf]); u_parts.append([self.cfg.CVAR_DAILY_LIMIT])
 
-        lb = np.full(n_vars, -np.inf)
-        ub = np.full(n_vars,  np.inf)
-        lb[:m]                   = 0.0;       ub[:m]                   = adv_limit
-        lb[m:2*m]                = 0.0        
-        lb[2*m+1:2*m+1+T_cvar]  = 0.0        
-        lb[-1]                   = 0.0        
+        # Variable bounds
+        lb, ub = np.full(n_vars, -np.inf), np.full(n_vars, np.inf)
+        lb[:m], ub[:m] = 0.0, adv_limit
+        lb[m:2*m], lb[2*m+1:2*m+1+T_cvar], lb[-1] = 0.0, 0.0, 0.0
         A_parts.append(sp.eye(n_vars, format="csc"))
         l_parts.append(lb.tolist()); u_parts.append(ub.tolist())
 
+        # Sector constraints
         if sector_labels is not None:
             labels = np.asarray(sector_labels, dtype=int)
             for sec_id in np.unique(labels):
                 mask = labels == sec_id
-                if mask.sum() < 2: continue
+                if mask.sum() < 2:
+                    continue
                 sec_row = sp.lil_matrix((1, n_vars))
                 sec_row[0, np.where(mask)[0]] = 1.0
                 A_parts.append(sec_row.tocsc())
                 l_parts.append([0.0]); u_parts.append([self.cfg.MAX_SECTOR_WEIGHT])
 
+        # Transaction cost auxiliary constraints
         tc = sp.lil_matrix((2 * m, n_vars))
         for i in range(m):
             tc[2*i,   i] =  1.0; tc[2*i,   m+i] = -1.0
@@ -610,35 +652,38 @@ class InstitutionalRiskEngine:
         l = np.array([v for block in l_parts for v in block], dtype=float)
         u = np.array([v for block in u_parts for v in block], dtype=float)
 
+        # ── Solve ─────────────────────────────────────────────────────────────
         prob = osqp.OSQP()
         prob.setup(
             P, q, A, l, u,
-            verbose=False, eps_abs=1e-4, eps_rel=1e-4, 
-            polish=True, adaptive_rho=True, max_iter=50000        
+            verbose=False, eps_abs=1e-4, eps_rel=1e-4,
+            polish=True, adaptive_rho=True, max_iter=50000,
         )
         res = prob.solve()
 
         if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
-            raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
+            raise OptimizationError(
+                f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL
+            )
 
-        w_opt  = np.maximum(res.x[:m], 0.0)
-        eta    = res.x[2*m]
-        z_vec  = res.x[2*m+1: 2*m+1+T_cvar]
+        w_opt             = np.maximum(res.x[:m], 0.0)
+        eta               = res.x[2*m]
+        z_vec             = res.x[2*m+1: 2*m+1+T_cvar]
         achieved_cvar     = float(eta + np.sum(z_vec) / (T_cvar * (1.0 - self.cfg.CVAR_ALPHA)))
         adv_binding_count = int(np.sum(w_opt >= adv_limit - 1e-6))
 
         self.last_diag = SolverDiagnostics(
-            status=res.info.status,
-            gamma_intent=gamma,
-            actual_weight=float(np.sum(w_opt)),
-            l_gamma=l_gamma,
-            u_gamma=u_gamma,
-            cvar_value=achieved_cvar,
-            slack_value=float(res.x[-1]),
-            sum_adv_limit=float(np.sum(adv_limit)),
-            adv_binding_count=adv_binding_count,
-            ridge_applied=ridge,
-            cond_number=float(np.linalg.cond(Sigma_reg)),
-            t_cvar=T_cvar,
+            status            = res.info.status,
+            gamma_intent      = gamma,
+            actual_weight     = float(np.sum(w_opt)),
+            l_gamma           = l_gamma,
+            u_gamma           = u_gamma,
+            cvar_value        = achieved_cvar,
+            slack_value       = float(res.x[-1]),
+            sum_adv_limit     = float(np.sum(adv_limit)),
+            adv_binding_count = adv_binding_count,
+            ridge_applied     = ridge,
+            cond_number       = float(np.linalg.cond(Sigma_reg)),
+            t_cvar            = T_cvar,
         )
         return w_opt

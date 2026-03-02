@@ -57,9 +57,10 @@ def test_generate_signals_deterministic():
     """Same inputs must produce identical outputs on repeated calls."""
     log_rets = _make_log_rets(120, 6)
     adv      = np.ones(6) * 1e6
+    cfg      = UltimateConfig(HISTORY_GATE=90, MAX_POSITIONS=5)
     slice_t1 = log_rets.iloc[:100]
-    raw1, scores1, sel1 = generate_signals(slice_t1, adv, history_gate=90, max_positions=5)
-    raw2, scores2, sel2 = generate_signals(slice_t1, adv, history_gate=90, max_positions=5)
+    raw1, scores1, sel1 = generate_signals(slice_t1, adv, cfg)
+    raw2, scores2, sel2 = generate_signals(slice_t1, adv, cfg)
     np.testing.assert_array_equal(raw1, raw2)
     assert sel1 == sel2
 
@@ -69,7 +70,8 @@ def test_generate_signals_history_gate():
     log_rets = _make_log_rets(100, 5)
     log_rets.iloc[:90, 0] = np.nan   # SYM00 has only 10 valid rows
     adv      = np.ones(5) * 1e6
-    _, _, sel_idx = generate_signals(log_rets, adv, history_gate=95, max_positions=5)
+    cfg      = UltimateConfig(HISTORY_GATE=95, MAX_POSITIONS=5)
+    _, _, sel_idx = generate_signals(log_rets, adv, cfg)
     assert 0 not in sel_idx, "SYM00 should be excluded by history gate."
 
 
@@ -81,9 +83,10 @@ def test_generate_signals_continuity_bonus():
         np.column_stack([base_col, base_col]), columns=["SYM0", "SYM1"]
     )
     adv          = np.ones(2) * 1e6
+    cfg          = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=2)
     prev_weights = {"SYM0": 0.10, "SYM1": 0.0}
     _, scores, _ = generate_signals(
-        log_rets, adv, history_gate=10, max_positions=2, prev_weights=prev_weights,
+        log_rets, adv, cfg, prev_weights=prev_weights,
     )
     assert scores[0] > scores[1], "Held asset must receive continuity bonus."
 
@@ -421,7 +424,7 @@ def test_data_cache_staleness_logic(tmp_path, monkeypatch):
         nonlocal download_called
         download_called = True
         return pd.DataFrame()
-    monkeypatch.setattr("data_cache._download_with_retry", mock_download)
+    monkeypatch.setattr("data_cache._download_with_timeout", mock_download)
     
     load_or_fetch(["TEST"], "2020-01-01", "2020-01-10", force_refresh=False)
     assert download_called, "Cache must trigger re-download if last_date misses yesterday's business day."
@@ -489,18 +492,17 @@ def test_e2e_ledger_parity():
                 np.log1p(returns.loc[:date].iloc[:-1])
                 .replace([np.inf, -np.inf], np.nan)
             )
-            # HIGH-INTEGRITY FIX: Utilize identical ADV computation mechanics to prevent parity discrepancies 
             adv_vector = _build_adv_vector(symbols, volume, date)
             pv         = live_state.cash + sum(
                 live_state.shares.get(s, 0) * close_t[s] for s in symbols
             )
+            # Use cached price logic exactly to match backtest parity
             prev_w_dict = {
-                sym: (live_state.shares.get(sym, 0) * float(close_t[sym])) / pv
+                sym: (live_state.shares.get(sym, 0) * live_state.last_known_prices.get(sym, 0.0)) / pv
                 for sym in symbols if live_state.shares.get(sym, 0) > 0 and pv > 0
             }
             raw, adj, sel = generate_signals(
-                hist_log_rets, adv_vector, cfg.HISTORY_GATE, cfg.MAX_POSITIONS,
-                prev_weights=prev_w_dict,
+                hist_log_rets, adv_vector, cfg, prev_weights=prev_w_dict,
             )
             prev_weights_arr = np.array([prev_w_dict.get(sym, 0.0) for sym in symbols])
 
@@ -567,7 +569,8 @@ def test_nan_sorting_trap_no_truncation():
         log_rets.iloc[:, i] = np.nan
 
     adv = np.ones(n_syms) * 1e6
-    _, adj_scores, sel_idx = generate_signals(log_rets, adv, history_gate=5, max_positions=10)
+    cfg = UltimateConfig(HISTORY_GATE=5, MAX_POSITIONS=10)
+    _, adj_scores, sel_idx = generate_signals(log_rets, adv, cfg)
 
     assert all(np.isfinite(adj_scores[i]) for i in sel_idx), \
         "Selected indices must not contain NaN-scored assets."
@@ -626,7 +629,7 @@ def test_volume_no_lookahead():
     adv_fri = _build_adv_vector(cols, volume, friday)
 
     expected_ma = float(
-        volume.loc[:friday, cols[0]].iloc[:-1].rolling(20).mean().iloc[-1]
+        volume.loc[:friday, cols[0]].iloc[:-1].rolling(20, min_periods=1).mean().iloc[-1]
     )
     assert abs(adv_fri[0] - expected_ma) < 1.0, \
         f"ADV {adv_fri[0]:.0f} does not match T-1 rolling mean {expected_ma:.0f} — lookahead present."
