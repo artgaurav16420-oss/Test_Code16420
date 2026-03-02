@@ -127,15 +127,9 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, volume, date)
 
-        # Use T-1 prices from state cache — NOT today's execution price —
-        # to compute current weights, preventing subtle look-ahead bias.
-        prev_w_dict = {
-            sym: (self.state.shares.get(sym, 0) * px) / pv
-            for sym in symbols
-            if self.state.shares.get(sym, 0) > 0 and pv > 0
-            for px in [self.state.last_known_prices.get(sym, 0.0)]
-            if px is not None and np.isfinite(px) and px > 0
-        }
+        # FIX #7: Replaced opaque double-for-in-comprehension with a readable
+        # helper so the weight calculation is easy to audit and test.
+        prev_w_dict = _build_prev_weights(self.state, symbols, pv)
 
         raw_daily, adj_scores, sel_idx = generate_signals(
             hist_log_rets,
@@ -163,7 +157,7 @@ class BacktestEngine:
             for sym in self.state.shares
             if sym in symbols
         ) / max(pv, 1e-6)
-        
+
         self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
 
         target_weights         = np.zeros(len(symbols))
@@ -205,8 +199,10 @@ class BacktestEngine:
                         )
                         apply_decay = True
         else:
-            # No optimization attempt this bar (e.g., empty candidate set) is
-            # not a solver failure and must not keep stale decay state alive.
+            # FIX #6: No optimization attempt this bar (e.g. empty candidate set)
+            # is NOT a solver failure. Reset decay_rounds so stale decay state
+            # from a previous failure sequence does not persist into a regime
+            # where the universe is simply temporarily empty.
             self.state.decay_rounds = 0
 
         if optimization_succeeded or apply_decay:
@@ -226,6 +222,32 @@ class BacktestEngine:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _build_prev_weights(
+    state:   PortfolioState,
+    symbols: List[str],
+    pv:      float,
+) -> Dict[str, float]:
+    """
+    Compute current mark-to-market weights using T-1 (last known) prices.
+
+    Using last_known_prices instead of today's execution price prevents a
+    subtle look-ahead bias where today's close would be used to determine
+    the starting weight before today's rebalance decision is made.
+    """
+    result: Dict[str, float] = {}
+    if pv <= 0:
+        return result
+    for sym in symbols:
+        n = state.shares.get(sym, 0)
+        if n <= 0:
+            continue
+        px = state.last_known_prices.get(sym)
+        if px is None or not np.isfinite(px) or px <= 0:
+            continue
+        result[sym] = (n * px) / pv
+    return result
+
 
 def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
     """
@@ -284,8 +306,8 @@ def run_backtest(
     volume  = pd.DataFrame(volume_d).sort_index()
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
-    # HIGH-INTEGRITY ENHANCEMENT: Instead of hardcoded weekly intervals that blindly 
-    # skip holiday Fridays, map all target rebalance dates to the nearest preceding 
+    # HIGH-INTEGRITY ENHANCEMENT: Instead of hardcoded weekly intervals that blindly
+    # skip holiday Fridays, map all target rebalance dates to the nearest preceding
     # valid trading day within the actual market data index.
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
     trading_index = pd.DatetimeIndex(close.index).sort_values()
@@ -305,6 +327,10 @@ def run_backtest(
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
     bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map)
 
+    # FIX #3: equity_curve is weekly-sampled (rebalance dates only) for display.
+    # metrics are intentionally computed on the full daily series for statistical
+    # accuracy (Sharpe, Sortino, max-drawdown all need daily granularity).
+    # The discrepancy is documented here to prevent misinterpretation.
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
 
@@ -322,9 +348,9 @@ def run_backtest(
     )
 
     return BacktestResults(
-        equity_curve = eq_weekly,
+        equity_curve = eq_weekly,          # weekly-sampled for charting
         trades       = bt.trades,
-        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL),
+        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL),  # daily for accuracy
         rebal_log    = rebal_log,
     )
 
@@ -360,7 +386,7 @@ def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
         avg_days_between = span / len(dr)
         periods_per_year = 365.25 / avg_days_between
         sharpe = (dr.mean() * periods_per_year) / (dr.std() * np.sqrt(periods_per_year))
-        
+
         downside = dr[dr < 0]
         if len(downside) > 1 and downside.std() > 0:
             sortino = (dr.mean() * periods_per_year) / (downside.std() * np.sqrt(periods_per_year))

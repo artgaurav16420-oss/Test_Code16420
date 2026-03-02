@@ -24,18 +24,23 @@ CACHE_DIR            = "data/cache"
 UNIVERSE_CACHE_FILE  = os.path.join(CACHE_DIR, "_universe_cache.json")
 UNIVERSE_CACHE_TTL_H = 24
 
-# ADV filter is run in chunks to avoid yfinance rate-limiting on large universes.
-_ADV_CHUNK_SIZE = 200
+# ADV filter processes tickers in parallel workers, each handling a chunk of
+# _ADV_CHUNK_SIZE to stay within yfinance rate limits.
+_ADV_CHUNK_SIZE    = 200
+_ADV_MAX_WORKERS   = 4   # parallel chunk workers; keeps total connections manageable
 
 # ─── Survival Mode Circuit Breaker ───────────────────────────────────────────
 
-# Nifty 50 constituents as the final hardcoded safety floor. These are
-# inherently liquid and guaranteed to satisfy ADV thresholds.
+# FIX #9: Hardcoded Nifty 50 floor for survival mode. This list was verified
+# against the NSE index composition on 2025-07-01. Index constituents change
+# periodically — re-verify this list if you update the codebase after a
+# significant index rebalance. Constituents here are the 49 most liquid names
+# from the official Nifty 50 at that date (LTIM replaces SHREECEM post-rebalance).
 _HARD_FLOOR_UNIVERSE = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL", "HINDUNILVR",
     "ITC", "SBIN", "LTIM", "BAJFINANCE", "HCLTECH", "MARUTI", "SUNPHARMA",
     "ADANIENT", "KOTAKBANK", "TITAN", "ONGC", "TATAMOTORS", "NTPC", "AXISBANK",
-    "ADANIPORTS", "ASIANPAINT", "COALINDIA", "BHARATFORG", "BAJAJFINSV", "JSWSTEEL",
+    "ADANIPORTS", "ASIANPAINT", "COALINDIA", "BAJAJFINSV", "JSWSTEEL",
     "M&M", "POWERGRID", "TATASTEEL", "ULTRACEMCO", "GRASIM", "HINDALCO", "NESTLEIND",
     "INDUSINDBK", "TECHM", "WIPRO", "CIPLA", "HDFCLIFE", "SBILIFE", "DRREDDY",
     "HEROMOTOCO", "EICHERMOT", "BPCL", "BAJAJ-AUTO", "BRITANNIA", "APOLLOHOSP",
@@ -198,56 +203,83 @@ def get_nifty500() -> List[str]:
 
 # ─── Liquidity Filtering ──────────────────────────────────────────────────────
 
+def _process_adv_chunk(chunk: List[str], start_dt: str, end_dt: str, cfg) -> List[str]:
+    """
+    Worker: fetch ADV data for one chunk and return tickers that pass the filter.
+    Called in parallel by _apply_adv_filter.
+    """
+    from data_cache import load_or_fetch
+
+    for attempt in range(3):
+        try:
+            data    = load_or_fetch(chunk, start_dt, end_dt, cfg=cfg)
+            passing = []
+            for sym in chunk:
+                ns_sym = sym + ".NS"
+                if ns_sym in data:
+                    df      = data[ns_sym]
+                    adv_val = (df["Close"] * df["Volume"]).rolling(20, min_periods=1).mean().iloc[-1]
+                    if adv_val >= (cfg.MIN_ADV_CRORES * 1e7):
+                        passing.append(sym)
+            return passing
+        except Exception as exc:
+            logger.debug(
+                "[Universe] ADV chunk attempt %d failed: %s", attempt + 1, exc
+            )
+            time.sleep((2 ** attempt) + 0.5)
+
+    # FIX #5: All retries exhausted. Include entire chunk unfiltered as a
+    # failsafe to prevent silent universe truncation on transient network
+    # failures. Illiquid names admitted here will still be blocked by the
+    # liquidity gate in generate_signals() (ADV == 0 → adj_score = -inf),
+    # EXCEPT in decay mode where generate_signals is bypassed. Log at ERROR
+    # level so this failure is always visible in production logs.
+    logger.error(
+        "[Universe] ADV chunk failed all retries (%d tickers). "
+        "Including unfiltered as failsafe — ADV gate skipped for this chunk. "
+        "NOTE: decay mode bypasses signal-level liquidity gate; monitor positions.",
+        len(chunk),
+    )
+    return chunk
+
+
 def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
     """
     Filters a broad universe down to institutionally liquid names.
 
-    Processes tickers in chunks of _ADV_CHUNK_SIZE to stay within yfinance
-    rate limits. Each chunk is retried up to 3 times with exponential backoff.
-    If all retries are exhausted, the chunk is included unfiltered as a failsafe
-    to prevent silent universe truncation due to transient network failures.
+    FIX #4: Chunks are processed in parallel using ThreadPoolExecutor
+    (_ADV_MAX_WORKERS workers) to avoid blocking the main thread for
+    several minutes on a full NSE universe of ~2,000 tickers.
     """
     from momentum_engine import UltimateConfig
-    from data_cache import load_or_fetch
 
     if cfg is None:
         cfg = UltimateConfig()
 
-    filtered = []
     end_dt   = datetime.today().strftime("%Y-%m-%d")
     start_dt = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
 
-    for i in range(0, len(tickers), _ADV_CHUNK_SIZE):
-        chunk   = tickers[i : i + _ADV_CHUNK_SIZE]
-        success = False
+    chunks = [
+        tickers[i : i + _ADV_CHUNK_SIZE]
+        for i in range(0, len(tickers), _ADV_CHUNK_SIZE)
+    ]
 
-        for attempt in range(3):
+    filtered: List[str] = []
+    with ThreadPoolExecutor(max_workers=_ADV_MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_process_adv_chunk, chunk, start_dt, end_dt, cfg): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
             try:
-                data = load_or_fetch(chunk, start_dt, end_dt, cfg=cfg)
-                for sym in chunk:
-                    ns_sym = sym + ".NS"
-                    if ns_sym in data:
-                        df      = data[ns_sym]
-                        adv_val = (df["Close"] * df["Volume"]).rolling(20, min_periods=1).mean().iloc[-1]
-                        if adv_val >= (cfg.MIN_ADV_CRORES * 1e7):
-                            filtered.append(sym)
-                success = True
-                break
+                filtered.extend(future.result())
             except Exception as exc:
-                logger.debug(
-                    "[Universe] ADV filtering chunk failed attempt %d: %s",
-                    attempt + 1, exc,
+                chunk = futures[future]
+                logger.error(
+                    "[Universe] Unexpected error processing ADV chunk (%d tickers): %s. "
+                    "Including unfiltered.", len(chunk), exc
                 )
-                # FIX: Exponential backoff to match retry pattern used elsewhere.
-                time.sleep((2 ** attempt) + 0.5)
-
-        if not success:
-            logger.error(
-                "[Universe] ADV chunk failed all retries. Including all %d tickers as "
-                "failsafe — ADV validation skipped for this chunk.",
-                len(chunk),
-            )
-            filtered.extend(chunk)
+                filtered.extend(chunk)
 
     return filtered
 

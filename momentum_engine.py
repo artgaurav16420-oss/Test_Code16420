@@ -168,7 +168,7 @@ class UltimateConfig:
     SLACK_PENALTY:            float = 10.0
     DIMENSIONALITY_MULTIPLIER:int   = 3
     MAX_SECTOR_WEIGHT:        float = 0.30
-    
+
     # Signal gates & scoring
     Z_SCORE_CLIP:             float = 3.0
     CONTINUITY_BONUS:         float = 0.15
@@ -302,7 +302,9 @@ class PortfolioState:
             "shares":               dict(sorted(self.shares.items())),
             "entry_prices":         _r(self.entry_prices),
             "equity_hist":          _r(self.equity_hist),
-            "universe":             self.universe,
+            # FIX #12: sort universe list so repeated saves of unchanged state
+            # produce byte-identical JSON files, enabling reliable diff auditing.
+            "universe":             sorted(self.universe),
             "cash":                 _r(self.cash),
             "exposure_multiplier":  _r(self.exposure_multiplier),
             "override_active":      self.override_active,
@@ -591,10 +593,10 @@ class InstitutionalRiskEngine:
         var_95   = ew_rets.quantile(1 - self.cfg.CVAR_ALPHA)
         ew_cvar  = -float(ew_rets[ew_rets <= var_95].mean()) if not ew_rets.empty else 0.0
         sentinel = self.cfg.CVAR_DAILY_LIMIT * self.cfg.CVAR_SENTINEL_MULTIPLIER
-        
+
         if ew_cvar > sentinel:
             logger.warning(
-                "Selection EW-CVaR %.2f%% exceeds sentinel %.2f%%. Forcing 50%% exposure reduction.", 
+                "Selection EW-CVaR %.2f%% exceeds sentinel %.2f%%. Forcing 50%% exposure reduction.",
                 ew_cvar * 100, sentinel * 100
             )
             gamma *= 0.5
@@ -693,7 +695,7 @@ class InstitutionalRiskEngine:
         for i in range(m):
             tc[2*i,   i] =  1.0; tc[2*i,   m+i] = -1.0
             tc[2*i+1, i] = -1.0; tc[2*i+1, m+i] = -1.0
-            
+
         tc_u = []
         for p in prev_w_arr:
             tc_u.extend([p, -p])
@@ -701,7 +703,7 @@ class InstitutionalRiskEngine:
 
         A, l, u = builder.build()
 
-        # ── Solve ────────────────────���────────────────────────────────────────
+        # ── Solve ─────────────────────────────────────────────────────────────
         prob = osqp.OSQP()
         prob.setup(
             P, q, A, l, u,

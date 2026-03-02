@@ -42,7 +42,8 @@ from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 
-__version__ = "11.42"
+# FIX #8: Align version with UltimateConfig docstring (was "11.42").
+__version__ = "11.43"
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -98,16 +99,16 @@ def _scrape_screener(base_url: str) -> List[str]:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    
+
     symbols = set()
     page = 1
     max_pages = 50
-    
+
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
     qs.pop('page', None)
     clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-    
+
     while page <= max_pages:
         sep = "&" if "?" in clean_url else "?"
         url = f"{clean_url}{sep}page={page}"
@@ -124,10 +125,10 @@ def _scrape_screener(base_url: str) -> List[str]:
             break
         elif resp.status_code != 200:
             break
-            
+
         soup = BeautifulSoup(resp.text, 'html.parser')
         links = soup.find_all('a', href=re.compile(r'^/company/[^/]+/(?:consolidated/)?$'))
-        
+
         page_symbols = 0
         before_count = len(symbols)
         for link in links:
@@ -145,13 +146,13 @@ def _scrape_screener(base_url: str) -> List[str]:
         # If a page adds no new symbols, pagination is effectively done.
         if len(symbols) == before_count:
             break
-            
+
         page += 1
         time.sleep(1)  # RATE LIMITING: Prevent IP bans from Screener.in
 
     if page > max_pages:
         logger.warning("[Screener] Reached pagination safety limit (%d pages).", max_pages)
-        
+
     return list(symbols)
 
 
@@ -181,10 +182,13 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
 
 def _get_custom_universe() -> List[str]:
     """Automatically gets universe from Screener.in URL or local fallback."""
-    DEFAULT_URL = "https://www.screener.in/screens/3506127/hello/"
+    # FIX #10: Replaced personal screen URL with an explicit placeholder.
+    # Users must set their own Screener.in public screen URL in
+    # data/screener_url.txt before using the Custom Screener option.
+    _SCREENER_URL_PLACEHOLDER = "https://www.screener.in/screens/YOUR_SCREEN_ID/YOUR_SCREEN_NAME/"
     url_file = "data/screener_url.txt"
-    
-    saved_url = DEFAULT_URL
+
+    saved_url = _SCREENER_URL_PLACEHOLDER
     if os.path.exists(url_file):
         with open(url_file, "r") as f:
             content = f.read().strip()
@@ -193,15 +197,20 @@ def _get_custom_universe() -> List[str]:
     else:
         os.makedirs("data", exist_ok=True)
         with open(url_file, "w") as f:
-            f.write(DEFAULT_URL)
-            
+            f.write(_SCREENER_URL_PLACEHOLDER)
+
+    if "YOUR_SCREEN_ID" in saved_url:
+        print(f"\n  {C.YLW}[!] No Screener.in URL configured.{C.RST}")
+        print(f"  {C.GRY}Edit data/screener_url.txt and replace the placeholder with your public screen URL.{C.RST}\n")
+        return []
+
     print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
     logger.info("[Screener] Fetching universe from: %s", saved_url)
-    
+
     tickers = _filter_valid_custom_tickers(_scrape_screener(saved_url))
     if tickers:
         return tickers
-        
+
     logger.warning("[Screener] Scraping failed or returned 0 tickers. Attempting local file fallback...")
 
     files = ["custom_screener.csv", "custom_screener.txt"]
@@ -236,8 +245,14 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
 
 # ─── Corporate action / split detection ──────────────────────────────────────
 
-_SPLIT_RATIOS = [2, 5, 10, 3, 4, 20, 0.5, 0.2]
-_SPLIT_TOLERANCE = 0.04   
+# FIX #2: Tightened split tolerance from 4% to 1.5%.
+# The original 4% window was wide enough to trigger on large single-day moves in
+# volatile NSE small-caps, especially if last_known_prices was stale after a cache
+# miss. At 1.5% the only plausible price ratio that falls within the window is a
+# genuine split. yfinance auto_adjust=True already handles splits on the price
+# series, so this detection is a safety net for live-portfolio share counts only.
+_SPLIT_RATIOS     = [2, 5, 10, 3, 4, 20, 0.5, 0.2]
+_SPLIT_TOLERANCE  = 0.015
 
 
 def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[str]:
@@ -300,14 +315,14 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 shutil.copy2(src, dst)
         if os.path.exists(state_file):
             shutil.copy2(state_file, f"{state_file}.bak.0")
-            
+
         with open(tmp_file, "w") as f:
             json.dump(state.to_dict(), f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-            
+
         os.replace(tmp_file, state_file)
-        
+
         if os.name == "posix":
             dir_fd = os.open("data", os.O_DIRECTORY)
             os.fsync(dir_fd)
@@ -366,8 +381,8 @@ def _run_scan(
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
         idx_df = market_data.get("^NSEI")
-        
-    idx_slice   = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
+
+    idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
     regime_score = compute_regime_score(idx_slice)
 
     close_d: Dict[str, pd.Series] = {}
@@ -387,7 +402,7 @@ def _run_scan(
         logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
 
     close    = pd.DataFrame(close_d).sort_index()
-    active   = list(close.columns)          
+    active   = list(close.columns)
     prices   = close.iloc[-1].values.astype(float)
     active_idx = {sym: i for i, sym in enumerate(active)}
 
@@ -400,13 +415,23 @@ def _run_scan(
     initial_cash = state.cash
     initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
 
-    close_hist    = close.iloc[:-1]   
+    close_hist    = close.iloc[:-1]
     log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
-    adv_arr       = compute_adv(market_data, active)  
+    adv_arr       = compute_adv(market_data, active)
     prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
     _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
 
-    state.update_exposure(regime_score, state.realised_cvar(), cfg, gross_exposure=initial_gross_exposure)
+    # FIX #1: Pass cfg.CVAR_MIN_HISTORY as min_obs so the live scan warm-up
+    # period matches the backtest exactly. The original call used the default
+    # min_obs=30, while the backtest used cfg.CVAR_MIN_HISTORY (default: 20),
+    # causing the exposure multiplier to diverge between live and backtest modes
+    # for the first 10 equity history observations.
+    state.update_exposure(
+        regime_score,
+        state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY),
+        cfg,
+        gross_exposure=initial_gross_exposure,
+    )
 
     weights              = np.zeros(len(active))
     apply_decay          = False
@@ -439,7 +464,7 @@ def _run_scan(
         )
         weights[sel_idx]               = weights_sel
         state.consecutive_failures     = 0
-        state.decay_rounds             = 0   
+        state.decay_rounds             = 0
         optimization_succeeded         = True
 
     except OptimizationError as exc:
@@ -472,7 +497,7 @@ def _run_scan(
         "Equity: %s₹%s%s | Slippage: %s₹%s%s",
         C.BLU, label, C.RST,
         regime_score,
-        state.realised_cvar() * 100,
+        state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY) * 100,
         state.consecutive_failures,
         C.GRN, f"{final_pv:,.0f}", C.RST,
         C.RED, f"{total_slippage:,.0f}", C.RST,
@@ -480,12 +505,12 @@ def _run_scan(
 
     elapsed = time.perf_counter() - scan_started_at
     _print_stage_status("Analysis", 1.0, f"{label} completed in {elapsed:.1f}s.")
-    
+
     if trade_log:
         final_mtm = sum(state.shares.get(sym, 0) * prices[active_idx[sym]] for sym in state.shares if sym in active_idx)
         final_gross_exposure = final_mtm / final_pv if final_pv > 0 else 0.0
         net_cash_delta = state.cash - initial_cash
-        
+
         print(f"\n  {C.B_CYN}=== PHASE A: TRADE INTENT SUMMARY ==={C.RST}")
         print(f"  {C.GRY}{'─' * 66}{C.RST}")
         print(f"  {C.BLD}Gross Exp Before:{C.RST} {initial_gross_exposure:>7.1%}")
@@ -501,9 +526,9 @@ def _run_scan(
 
         print(f"\n  {C.B_CYN}=== PHASE B: EXECUTION ACTION SHEET ==={C.RST}")
         print(f"  {C.GRY}{'─' * 66}{C.RST}")
-        
+
         sorted_trades = sorted(trade_log, key=lambda t: state.weights.get(t.symbol, 0.0), reverse=True)
-        
+
         for t in sorted_trades:
             action_color = C.B_GRN if t.direction == "BUY" else C.B_RED
             target_weight = state.weights.get(t.symbol, 0.0)
@@ -715,14 +740,14 @@ def main_menu() -> None:
                 print(f"  {C.RED}[!] No custom universe found.{C.RST}")
                 print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
                 continue
-                
+
             logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
             _check_and_prompt_initial_capital(states["custom"], "CUSTOM SCREENER", "custom")
-            
+
             custom_cfg = UltimateConfig()
             if len(universe) < 100:
                 custom_cfg.MAX_POSITIONS = 8
-                
+
             preview      = copy.deepcopy(states["custom"])
             preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg)
             mkt_cache["custom"] = mkt
@@ -740,14 +765,14 @@ def main_menu() -> None:
             bt_c = _prompt_menu_choice(f"  {C.CYN}Choice [Default 2]: {C.RST}", ["1", "2", "3"], default="2")
             if not bt_c:
                 continue
-            
+
             raw_start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}")
             try:
                 start = _normalise_start_date(raw_start)
             except ValueError as exc:
                 print(f"  {C.RED}{exc}{C.RST}")
                 continue
-            
+
             if bt_c == "1":
                 universe = fetch_nse_equity_universe()
             elif bt_c == "3":
@@ -827,14 +852,14 @@ def main_menu() -> None:
 
 if __name__ == "__main__":
     # ── Professional logging: console + file ───────────────────────────────
-    os.makedirs("logs", exist_ok=True)          # create logs/ folder if missing
+    os.makedirs("logs", exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
         format=f"{C.GRY}[%(asctime)s]{C.RST} %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
         handlers=[
-            logging.StreamHandler(),                                 # console (existing behaviour)
+            logging.StreamHandler(),
             logging.FileHandler("logs/ultimate.log", encoding="utf-8", mode="a")
         ]
     )
