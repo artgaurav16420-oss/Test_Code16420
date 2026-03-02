@@ -101,13 +101,14 @@ def _scrape_screener(base_url: str) -> List[str]:
     
     symbols = set()
     page = 1
+    max_pages = 50
     
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
     qs.pop('page', None)
     clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
     
-    while True:
+    while page <= max_pages:
         sep = "&" if "?" in clean_url else "?"
         url = f"{clean_url}{sep}page={page}"
         try:
@@ -128,18 +129,28 @@ def _scrape_screener(base_url: str) -> List[str]:
         links = soup.find_all('a', href=re.compile(r'^/company/[^/]+/(?:consolidated/)?$'))
         
         page_symbols = 0
+        before_count = len(symbols)
         for link in links:
             match = re.search(r'/company/([^/]+)/', link['href'])
             if match:
                 sym = match.group(1).upper()
                 symbols.add(sym)
                 page_symbols += 1
-                
+
+        # Stop when there are no symbols at all on the page.
         if page_symbols == 0:
+            break
+
+        # Some screens ignore `?page=` and keep returning page 1 forever.
+        # If a page adds no new symbols, pagination is effectively done.
+        if len(symbols) == before_count:
             break
             
         page += 1
         time.sleep(1)  # RATE LIMITING: Prevent IP bans from Screener.in
+
+    if page > max_pages:
+        logger.warning("[Screener] Reached pagination safety limit (%d pages).", max_pages)
         
     return list(symbols)
 
