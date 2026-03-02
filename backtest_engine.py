@@ -204,6 +204,10 @@ class BacktestEngine:
                             (1 - cfg.DECAY_FACTOR) * 100, date,
                         )
                         apply_decay = True
+        else:
+            # No optimization attempt this bar (e.g., empty candidate set) is
+            # not a solver failure and must not keep stale decay state alive.
+            self.state.decay_rounds = 0
 
         if optimization_succeeded or apply_decay:
             execute_rebalance(

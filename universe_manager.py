@@ -57,6 +57,8 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
     # Consumer
     "HINDUNILVR": "Consumer",  "ITC":        "Consumer",   "NESTLEIND":  "Consumer",
     "TITAN":      "Consumer",  "ASIANPAINT": "Consumer",   "TATACONSUM": "Consumer",
+    # Telecom
+    "BHARTIARTL": "Telecom",
     # Auto
     "MARUTI":     "Auto",      "TATAMOTORS": "Auto",       "M&M":        "Auto",
     "BAJAJ-AUTO": "Auto",      "EICHERMOT":  "Auto",       "HEROMOTOCO": "Auto",
