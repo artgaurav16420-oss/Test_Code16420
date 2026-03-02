@@ -21,6 +21,7 @@ from momentum_engine import (
     OptimizationErrorType,
     PortfolioState,
     execute_rebalance,
+    _ConstraintBuilder,
 )
 from backtest_engine import BacktestEngine, run_backtest, _compute_metrics, _build_adv_vector
 from universe_manager import STATIC_NSE_SECTORS
@@ -89,6 +90,14 @@ def test_generate_signals_continuity_bonus():
         log_rets, adv, cfg, prev_weights=prev_weights,
     )
     assert scores[0] > scores[1], "Held asset must receive continuity bonus."
+
+
+def test_generate_signals_blocks_empty_input():
+    """A completely empty array should trip the defensive barrier before math crash."""
+    cfg = UltimateConfig()
+    empty_df = pd.DataFrame()
+    with pytest.raises(ValueError, match="no valid data"):
+        generate_signals(empty_df, np.array([]), cfg)
 
 
 def test_regime_score_neutral_on_thin_history():
@@ -200,19 +209,20 @@ def test_optimizer_adv_binding_count_populated():
     assert isinstance(engine.last_diag.adv_binding_count, int)
 
 
-def test_optimizer_cvar_sentinel_abort():
-    """Optimizer must reject combinations where single-asset CVaR wildly breaches safe limits."""
+def test_optimizer_cvar_sentinel_deleverages():
+    """Optimizer must gracefully deleverage (not hard abort) when single-asset CVaR is wildly high."""
     n_days, m = 250, 5
     log_rets = _make_log_rets(n_days, m)
-    # Inject massive daily loss into ALL assets to trip the EW-CVaR sentinel
+    # Inject massive daily loss to trip the EW-CVaR sentinel
     log_rets.iloc[-20:, :] = -0.15 
     
     engine = _make_engine()
-    with pytest.raises(OptimizationError) as exc_info:
-        engine.optimize(
-            np.ones(m)*0.01, log_rets, np.ones(m)*1e6, np.ones(m)*100, 1e6
-        )
-    assert exc_info.value.error_type == OptimizationErrorType.INFEASIBLE
+    w_opt = engine.optimize(
+        np.ones(m)*0.01, log_rets, np.ones(m)*1e6, np.ones(m)*100, 1e6, exposure_multiplier=1.0
+    )
+    # Assert that weights were significantly scaled down due to CVaR sentinel (gamma *= 0.5)
+    # Normally max weights would sum near 1.0. With 0.5 penalty and FLOOR=0.25, it should be <= 0.6
+    assert np.sum(w_opt) < 0.6, "Sentinel should have triggered a deleverage multiplier."
 
 
 def test_portfolio_state_serialisation_roundtrip():
@@ -458,6 +468,19 @@ def test_compute_metrics_annualisation():
     m = _compute_metrics(eq, 1_000_000.0)
     assert np.isfinite(m["sharpe"])
     assert -10.0 < m["sharpe"] < 10.0
+
+
+def test_compute_metrics_sortino():
+    """Sortino ratio accurately accounts for downside variance."""
+    idx = pd.date_range("2020-01-03", periods=104, freq="W-FRI")
+    eq_vals = np.linspace(1_000_000, 1_200_000, 104)
+    # Inject two sharp localized drops to ensure non-zero downside variance
+    eq_vals[10] -= 50_000 
+    eq_vals[50] -= 50_000 
+    eq = pd.Series(eq_vals, index=idx)
+    m = _compute_metrics(eq, 1_000_000.0)
+    assert np.isfinite(m["sortino"])
+    assert m["sortino"] > 0
 
 
 def test_e2e_ledger_parity():

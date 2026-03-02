@@ -139,6 +139,7 @@ def _scrape_screener(base_url: str) -> List[str]:
             break
             
         page += 1
+        time.sleep(1)  # RATE LIMITING: Prevent IP bans from Screener.in
         
     return list(symbols)
 
@@ -258,17 +259,26 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 shutil.copy2(src, dst)
         if os.path.exists(state_file):
             shutil.copy2(state_file, f"{state_file}.bak.0")
+            
         with open(tmp_file, "w") as f:
             json.dump(state.to_dict(), f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
+            
         os.replace(tmp_file, state_file)
+        
         if os.name == "posix":
             dir_fd = os.open("data", os.O_DIRECTORY)
             os.fsync(dir_fd)
             os.close(dir_fd)
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
+        # DEFENSIVE FIX: Scrub dangling tmp file if JSON serialization crashes mid-flight
+        if os.path.exists(tmp_file):
+            try:
+                os.remove(tmp_file)
+            except Exception:
+                pass
 
 
 def load_portfolio_state(name: str) -> PortfolioState:

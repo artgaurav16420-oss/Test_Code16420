@@ -139,11 +139,13 @@ def generate_signals(
     if prev_weights is None:
         prev_weights = {}
 
+    # HIGH-INTEGRITY FIX: Validation guard to prevent hard math crashes 
+    # if upstream filters remove all valid trading data
+    if log_rets.empty or log_rets.isna().all().all():
+        raise ValueError("generate_signals: log_rets contains no valid data.")
+
     active = list(log_rets.columns)
 
-    # FIX: Assert array alignment up front. A length mismatch causes the
-    # liquidity gate to silently gate the wrong assets or raise an IndexError
-    # with no diagnostic context — catching it here gives a clear error message.
     if len(adv_arr) != len(active):
         raise ValueError(
             f"generate_signals: adv_arr length {len(adv_arr)} != "

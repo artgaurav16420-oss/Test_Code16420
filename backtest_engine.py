@@ -26,8 +26,7 @@ from momentum_engine import (
 )
 from signals import generate_signals, compute_regime_score, compute_single_adv
 
-logger     = logging.getLogger(__name__)
-REBAL_FREQ = "W-FRI"
+logger = logging.getLogger(__name__)
 
 
 # ─── Results container ────────────────────────────────────────────────────────
@@ -67,9 +66,7 @@ class BacktestEngine:
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
         symbols  = list(close.columns)
 
-        # FIX: Convert rebalance_dates to a set for O(1) membership tests.
-        # pd.DatetimeIndex.__contains__ is O(n); over a 5-year daily backtest
-        # this adds ~338k redundant comparisons per run.
+        # O(1) membership tests for rapid daily simulation
         rebal_set = set(rebalance_dates)
 
         for date in close.index:
@@ -152,9 +149,6 @@ class BacktestEngine:
         regime_score = compute_regime_score(idx_slice)
 
         # Guard: only use realised CVaR once enough history has accumulated.
-        # Below cfg.CVAR_MIN_HISTORY observations the value is statistically
-        # meaningless and would suppress the exposure multiplier at backtest
-        # start due to a CVaR computed from 1–3 data points.
         if len(self.state.equity_hist) >= cfg.CVAR_MIN_HISTORY:
             realised_cvar = self.state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
         else:
@@ -169,6 +163,7 @@ class BacktestEngine:
             for sym in self.state.shares
             if sym in symbols
         ) / max(pv, 1e-6)
+        
         self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
 
         target_weights         = np.zeros(len(symbols))
@@ -231,16 +226,12 @@ class BacktestEngine:
 def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
     """
     Build the ADV (average daily volume) vector for sizing constraints.
-
-    Applies the T-1 slice (iloc[:-1]) before delegating to compute_single_adv,
-    ensuring the current rebalance date's volume is excluded (look-ahead fix).
-    The outer try/except guards against pandas indexing errors on sparse data.
+    Applies the T-1 slice (iloc[:-1]) before delegating to compute_single_adv.
     """
     adv = []
     for sym in symbols:
         if sym in volume.columns:
             try:
-                # iloc[:-1]: exclude the current rebalance date (look-ahead fix).
                 series = volume.loc[:date, sym].iloc[:-1]
                 adv.append(compute_single_adv(series))
             except Exception:
@@ -289,9 +280,12 @@ def run_backtest(
     volume  = pd.DataFrame(volume_d).sort_index()
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
-    rebal_dates = close.index[
-        close.index.isin(pd.date_range(start_date, end_date, freq=REBAL_FREQ))
-    ]
+    # HIGH-INTEGRITY ENHANCEMENT: Instead of hardcoded weekly intervals that blindly 
+    # skip holiday Fridays, map all target rebalance dates to the nearest preceding 
+    # valid trading day within the actual market data index.
+    all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
+    valid_rebal_dates = close.index.asof(all_target_dates).dropna().unique()
+    rebal_dates = pd.DatetimeIndex(valid_rebal_dates)
 
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
@@ -333,6 +327,7 @@ def print_backtest_results(results: BacktestResults) -> None:
         f"  \033[1mFinal:\033[0m \033[32m₹{m['final']:,.0f}\033[0m  "
         f"\033[1mCAGR:\033[0m {m['cagr']:.2f}%  "
         f"\033[1mSharpe:\033[0m {m['sharpe']:.2f}  "
+        f"\033[1mSortino:\033[0m {m['sortino']:.2f}  "
         f"\033[1mMaxDD:\033[0m {m['max_dd']:.2f}%  "
         f"\033[1mCalmar:\033[0m {m['calmar']:.2f}"
     )
@@ -341,7 +336,7 @@ def print_backtest_results(results: BacktestResults) -> None:
 
 def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
     if eq.empty:
-        return {"cagr": 0.0, "max_dd": 0.0, "final": initial, "sharpe": 0.0, "calmar": 0.0}
+        return {"cagr": 0.0, "max_dd": 0.0, "final": initial, "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0}
 
     final  = float(eq.iloc[-1])
     span   = (eq.index[-1] - eq.index[0]).days
@@ -355,15 +350,23 @@ def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
         avg_days_between = span / len(dr)
         periods_per_year = 365.25 / avg_days_between
         sharpe = (dr.mean() * periods_per_year) / (dr.std() * np.sqrt(periods_per_year))
+        
+        downside = dr[dr < 0]
+        if len(downside) > 1 and downside.std() > 0:
+            sortino = (dr.mean() * periods_per_year) / (downside.std() * np.sqrt(periods_per_year))
+        else:
+            sortino = sharpe  # Fallback if no downside volatility exists
     else:
-        sharpe = 0.0
+        sharpe  = 0.0
+        sortino = 0.0
 
     calmar = (cagr / abs(max_dd)) if max_dd < 0 else 0.0
 
     return {
-        "cagr":   round(cagr,   2),
-        "max_dd": round(max_dd, 2),
-        "final":  round(final,  2),
-        "sharpe": round(sharpe, 2),
-        "calmar": round(calmar, 2),
+        "cagr":    round(cagr,    2),
+        "max_dd":  round(max_dd,  2),
+        "final":   round(final,   2),
+        "sharpe":  round(sharpe,  2),
+        "sortino": round(sortino, 2),
+        "calmar":  round(calmar,  2),
     }

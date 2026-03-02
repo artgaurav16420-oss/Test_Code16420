@@ -23,7 +23,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -100,13 +100,36 @@ class SolverDiagnostics:
         return self.actual_weight / self.u_gamma if self.u_gamma > 0 else 0.0
 
 
+# ─── Matrix Building Helper ───────────────────────────────────────────────────
+
+class _ConstraintBuilder:
+    """
+    Encapsulates OSQP sparse matrix construction to improve auditability.
+    Replaces repetitive and error-prone individual block appends.
+    """
+    def __init__(self, n_vars: int):
+        self.n_vars = n_vars
+        self.A_parts: list = []
+        self.l_parts: list = []
+        self.u_parts: list = []
+
+    def add_constraint(self, A_matrix, lower_bound, upper_bound):
+        self.A_parts.append(A_matrix)
+        self.l_parts.append(lower_bound)
+        self.u_parts.append(upper_bound)
+
+    def build(self) -> Tuple[sp.csc_matrix, np.ndarray, np.ndarray]:
+        A = sp.vstack(self.A_parts, format="csc")
+        l = np.array([v for block in self.l_parts for v in block], dtype=float)
+        u = np.array([v for block in self.u_parts for v in block], dtype=float)
+        return A, l, u
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 @dataclass
 class UltimateConfig:
     # Portfolio construction
-    # MAX_POSITIONS 15→20: Nifty 500 is a clean, liquid universe; more positions
-    # improves diversification without diluting signal quality.
     INITIAL_CAPITAL:          float = 1_000_000.0
     MAX_POSITIONS:            int   = 20
     MAX_PORTFOLIO_RISK_PCT:   float = 0.12
@@ -119,7 +142,7 @@ class UltimateConfig:
     CVAR_ALPHA:               float = 0.95
     CVAR_LOOKBACK:            int   = 200
     CVAR_SENTINEL_MULTIPLIER: float = 2.5
-    CVAR_MIN_HISTORY: int = 20
+    CVAR_MIN_HISTORY:         int   = 20
 
     # Exposure management
     DELEVERAGING_LIMIT:       float = 0.10
@@ -135,11 +158,10 @@ class UltimateConfig:
     DIMENSIONALITY_MULTIPLIER:int   = 3
     MAX_SECTOR_WEIGHT:        float = 0.30
 
-    # Execution
+    # Timing & Execution
+    REBALANCE_FREQ:           str   = "W-FRI"
     SLIPPAGE_BPS:             float = 20.0
     DECAY_FACTOR:             float = 0.85
-    # MIN_ADV_CRORES 50→100: Every Nifty 500 constituent clears ₹100cr/day.
-    # This now acts as a data-quality guard, not a universe filter.
     MIN_ADV_CRORES:           float = 100.0
 
     # Ghost position / data-glitch protection
@@ -497,6 +519,11 @@ class InstitutionalRiskEngine:
                 "prev_w length must match expected_returns length.",
                 OptimizationErrorType.DATA,
             )
+        if sector_labels is not None and len(sector_labels) != m:
+            raise OptimizationError(
+                "Sector mapping array length does not match expected_returns length.",
+                OptimizationErrorType.DATA,
+            )
         if not np.all(np.isfinite(expected_returns)):
             raise OptimizationError(
                 "expected_returns contains non-finite values.", OptimizationErrorType.DATA
@@ -523,17 +550,6 @@ class InstitutionalRiskEngine:
                 f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA
             )
 
-        # ── CVaR sentinel (EW basket check, not worst single asset) ──────────
-        ew_rets  = clean_rets.mean(axis=1)
-        var_95   = ew_rets.quantile(1 - self.cfg.CVAR_ALPHA)
-        ew_cvar  = -float(ew_rets[ew_rets <= var_95].mean()) if not ew_rets.empty else 0.0
-        sentinel = self.cfg.CVAR_DAILY_LIMIT * self.cfg.CVAR_SENTINEL_MULTIPLIER
-        if ew_cvar > sentinel:
-            raise OptimizationError(
-                f"Selection EW-CVaR {ew_cvar:.2%} exceeds sentinel {sentinel:.2%}.",
-                OptimizationErrorType.INFEASIBLE,
-            )
-
         # ── Covariance estimation (LedoitWolf instantiated per call for thread safety) ──
         lw = LedoitWolf()
         lw.fit(clean_rets)
@@ -543,6 +559,23 @@ class InstitutionalRiskEngine:
 
         # ── Exposure bounds ───────────────────────────────────────────────────
         gamma     = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
+
+        # HIGH-INTEGRITY FIX: Replaced aggressive CVaR hard-abort with dynamic deleveraging trigger.
+        # This allows portfolios with elevated EW-CVaR to survive by clamping the max allocation bounds
+        # rather than throwing out the entire optimization cycle for that week.
+        ew_rets  = clean_rets.mean(axis=1)
+        var_95   = ew_rets.quantile(1 - self.cfg.CVAR_ALPHA)
+        ew_cvar  = -float(ew_rets[ew_rets <= var_95].mean()) if not ew_rets.empty else 0.0
+        sentinel = self.cfg.CVAR_DAILY_LIMIT * self.cfg.CVAR_SENTINEL_MULTIPLIER
+        
+        if ew_cvar > sentinel:
+            logger.warning(
+                "Selection EW-CVaR %.2f%% exceeds sentinel %.2f%%. Forcing 50%% exposure reduction.", 
+                ew_cvar * 100, sentinel * 100
+            )
+            gamma *= 0.5
+            gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma)
+
         adv_limit = np.clip(
             (adv_shares * prices * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40
         )
@@ -589,16 +622,14 @@ class InstitutionalRiskEngine:
         q[m:2*m] = self.cfg.SLIPPAGE_BPS / 10_000.0
         q[-1]    = self.cfg.SLACK_PENALTY
 
-        A_parts: list = []
-        l_parts: list = []
-        u_parts: list = []
+        # HIGH-INTEGRITY REFACTOR: Replaced manual list-appends with a dedicated builder class.
+        builder = _ConstraintBuilder(n_vars)
 
         # Budget constraint
         budget_row = sp.csc_matrix(
             (np.ones(m), (np.zeros(m, int), np.arange(m))), shape=(1, n_vars)
         )
-        A_parts.append(budget_row)
-        l_parts.append([l_gamma]); u_parts.append([u_gamma])
+        builder.add_constraint(budget_row, [l_gamma], [u_gamma])
 
         # CVaR scenario constraints
         A_scen = sp.lil_matrix((T_cvar, n_vars))
@@ -606,8 +637,7 @@ class InstitutionalRiskEngine:
         A_scen[:, 2*m] = -1.0
         for i in range(T_cvar):
             A_scen[i, 2*m + 1 + i] = -1.0
-        A_parts.append(A_scen.tocsc())
-        l_parts.append([-np.inf] * T_cvar); u_parts.append([0.0] * T_cvar)
+        builder.add_constraint(A_scen.tocsc(), [-np.inf] * T_cvar, [0.0] * T_cvar)
 
         # CVaR daily limit
         scen_c = 1.0 / (T_cvar * (1.0 - self.cfg.CVAR_ALPHA))
@@ -615,15 +645,13 @@ class InstitutionalRiskEngine:
         lim[0, 2*m]                 = 1.0
         lim[0, 2*m+1:2*m+1+T_cvar] = scen_c
         lim[0, -1]                  = -1.0
-        A_parts.append(lim.tocsc())
-        l_parts.append([-np.inf]); u_parts.append([self.cfg.CVAR_DAILY_LIMIT])
+        builder.add_constraint(lim.tocsc(), [-np.inf], [self.cfg.CVAR_DAILY_LIMIT])
 
         # Variable bounds
         lb, ub = np.full(n_vars, -np.inf), np.full(n_vars, np.inf)
         lb[:m], ub[:m] = 0.0, adv_limit
         lb[m:2*m], lb[2*m+1:2*m+1+T_cvar], lb[-1] = 0.0, 0.0, 0.0
-        A_parts.append(sp.eye(n_vars, format="csc"))
-        l_parts.append(lb.tolist()); u_parts.append(ub.tolist())
+        builder.add_constraint(sp.eye(n_vars, format="csc"), lb.tolist(), ub.tolist())
 
         # Sector constraints
         if sector_labels is not None:
@@ -634,23 +662,20 @@ class InstitutionalRiskEngine:
                     continue
                 sec_row = sp.lil_matrix((1, n_vars))
                 sec_row[0, np.where(mask)[0]] = 1.0
-                A_parts.append(sec_row.tocsc())
-                l_parts.append([0.0]); u_parts.append([self.cfg.MAX_SECTOR_WEIGHT])
+                builder.add_constraint(sec_row.tocsc(), [0.0], [self.cfg.MAX_SECTOR_WEIGHT])
 
         # Transaction cost auxiliary constraints
         tc = sp.lil_matrix((2 * m, n_vars))
         for i in range(m):
             tc[2*i,   i] =  1.0; tc[2*i,   m+i] = -1.0
             tc[2*i+1, i] = -1.0; tc[2*i+1, m+i] = -1.0
-        A_parts.append(tc.tocsc())
+            
         tc_u = []
         for p in prev_w_arr:
             tc_u.extend([p, -p])
-        l_parts.append([-np.inf] * (2 * m)); u_parts.append(tc_u)
+        builder.add_constraint(tc.tocsc(), [-np.inf] * (2 * m), tc_u)
 
-        A = sp.vstack(A_parts, format="csc")
-        l = np.array([v for block in l_parts for v in block], dtype=float)
-        u = np.array([v for block in u_parts for v in block], dtype=float)
+        A, l, u = builder.build()
 
         # ── Solve ─────────────────────────────────────────────────────────────
         prob = osqp.OSQP()
