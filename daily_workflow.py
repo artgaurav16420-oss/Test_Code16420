@@ -182,28 +182,12 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
 
 def _get_custom_universe() -> List[str]:
     """Automatically gets universe from Screener.in URL or local fallback."""
-    # FIX #10: Replaced personal screen URL with an explicit placeholder.
-    # Users must set their own Screener.in public screen URL in
-    # data/screener_url.txt before using the Custom Screener option.
-    _SCREENER_URL_PLACEHOLDER = "https://www.screener.in/screens/YOUR_SCREEN_ID/YOUR_SCREEN_NAME/"
-    url_file = "data/screener_url.txt"
+    # Hardcoded Screener URL
+    saved_url = "https://www.screener.in/screens/3506127/hello/"
 
-    saved_url = _SCREENER_URL_PLACEHOLDER
-    if os.path.exists(url_file):
-        with open(url_file, "r") as f:
-            content = f.read().strip()
-            if content:
-                saved_url = content
-    else:
-        os.makedirs("data", exist_ok=True)
-        with open(url_file, "w") as f:
-            f.write(_SCREENER_URL_PLACEHOLDER)
-
-    if "YOUR_SCREEN_ID" in saved_url:
-        print(f"\n  {C.YLW}[!] No Screener.in URL configured.{C.RST}")
-        print(f"  {C.GRY}Edit data/screener_url.txt and replace the placeholder with your public screen URL.{C.RST}\n")
-        return []
-
+    print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
+    logger.info("[Screener] Fetching universe from: %s", saved_url)
+    
     print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
     logger.info("[Screener] Fetching universe from: %s", saved_url)
 
